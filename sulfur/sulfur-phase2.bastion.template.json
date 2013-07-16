@@ -1,0 +1,338 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+
+  "Description": "This template creates a bastion EC2 instance in a specified public subnet. The bastion host has two main functions - proxying HTTP/S requests from the private subnets and providing SSH and VPN access as a service. The EC2 instance is assigned an Elastic IP address and a security group.",
+
+  "Parameters": {
+
+    "InstanceType": {
+      "Description": "Bastion Server EC2 instance type",
+      "Type": "String",
+      "Default": "m1.small",
+      "AllowedValues": [ "t1.micro","m1.small","m1.medium","m1.large","m1.xlarge","m2.xlarge","m2.2xlarge","m2.4xlarge","c1.medium","c1.xlarge","cc1.4xlarge","cc2.8xlarge","cg1.4xlarge"],
+      "ConstraintDescription": "must be a valid EC2 instance type. running a t1.micro inside a VPC is unsupported by AWS at the moment!"
+    },
+
+    "KeyName": {
+      "Description": "KeyPair for SSH access to the instances. It must exist.",
+      "Type": "String"
+    },
+
+    "Environment": {
+      "Description": "The name of the environment for this stack",
+      "Type": "String",
+      "Default": "production",
+      "AllowedValues": ["production", "staging", "development" ],
+      "ConstraintDescription": "must be one of production, staging or development"
+    },
+    
+    "Domain": {
+      "Description": "The domain name for this stack",
+      "Type": "String",
+      "Default": "sulfur.erinin.net"
+    },
+
+    "StackName": {
+      "Description": "The name of the stack",
+      "Type": "String",
+      "MinLength": "1",
+      "MaxLength": "128"
+    },
+
+    "PublicNetworkID": {
+      "Type": "String",
+      "MinLength": "4",
+      "MaxLength": "50",
+      "Description": "The Subnet ID to be used by the bastion instance (must be a public network)."
+    },
+
+    "VPC": {
+      "Description": "The name of the VPC in which the server should spawn",
+      "Type": "String",
+      "MinLength": "1",
+      "MaxLength": "128"
+    },
+
+    "VPNNetworkAddress": {
+      "Type": "String",
+      "MinLength": "9",
+      "MaxLength": "23",
+      "Description": "Network (without netmask) to be used inside the VPN (must be in the private ranges).",
+      "AllowedPattern": "^(10\\.\\d{1,3}|172\\.([12]\\d|3[01])|192\\.168)\\.\\d{1,3}\\.\\d{1,3}$" 
+    },
+    "WebServerNetwork": {
+      "Type": "String",
+      "MinLength": "11",
+      "MaxLength": "23",
+      "Description": "The network address (with a bitmask) used by web servers (must be in the private ranges).",
+      "AllowedPattern": "^(10\\.\\d{1,3}|172\\.([12]\\d|3[01])|192\\.168)\\.\\d{1,3}\\.\\d{1,3}/\\d{1,2}$" 
+    },
+    "DBServerNetwork": {
+      "Type": "String",
+      "MinLength": "11",
+      "MaxLength": "23",
+      "Description": "The network address (with a bitmask) used by DB servers (must be in the private ranges).",
+      "AllowedPattern": "^(10\\.\\d{1,3}|172\\.([12]\\d|3[01])|192\\.168)\\.\\d{1,3}\\.\\d{1,3}/\\d{1,2}$" 
+    },
+    "ServersNetwork": {
+      "Type": "String",
+      "MinLength": "19",
+      "MaxLength": "32",
+      "Description": "Address and netmask, separated by space, used by the servers (must be in the private ranges). (eg. 10.11.42.0 255.255.0.0)",
+      "AllowedPattern": "^(10\\.\\d{1,3}|172\\.([12]\\d|3[01])|192\\.168)\\.\\d{1,3}\\.\\d{1,3} 255\\.((255|254|252|248|240|224|192|128)\\.){2}(255|254|252|248|240|224|192|128|0)$" 
+    },
+    "ChefRepo": {
+      "Description": "The Git repository that holds the chef recipes. At the moment this must be a public repository, a method for authentication is not provisioned yet.",
+      "Type": "String",
+      "Default": "https://github.com/zorlem/chef-cookbooks-repo.git",
+      "MinLength": "10",
+      "AllowedPattern": "^(http|https|git)://.*" 
+    }
+  },
+  "Mappings": {
+    "RegionArch2AMI" : {
+      "us-east-1"      : { "32" : "ami-c5b202ac", "64" : "ami-c7b202ae" },
+      "us-west-1"      : { "32" : "ami-b988acfc", "64" : "ami-bb88acfe" },
+      "us-west-2"      : { "32" : "ami-184fc128", "64" : "ami-1a4fc12a" },
+      "eu-west-1"      : { "32" : "ami-534a4b27", "64" : "ami-5d4a4b29" },
+      "sa-east-1"      : { "32" : "ami-68c91075", "64" : "ami-6ac91077" },
+      "ap-southeast-1" : { "32" : "ami-923575c0", "64" : "ami-903575c2" },
+      "ap-northeast-1" : { "32" : "ami-8676ca87", "64" : "ami-8876ca89" }
+    },
+    "InstanceType2Arch": {
+      "t1.micro"    : { "Arch": "32" },
+      "m1.small"    : { "Arch": "32" },
+      "m1.medium"   : { "Arch": "64" },
+      "m1.large"    : { "Arch": "64" },
+      "m1.xlarge"   : { "Arch": "64" },
+      "m2.xlarge"   : { "Arch": "64" },
+      "m2.2xlarge"  : { "Arch": "64" },
+      "m2.4xlarge"  : { "Arch": "64" },
+      "c1.medium"   : { "Arch": "64" },
+      "c1.xlarge"   : { "Arch": "64" }
+    }
+  },
+  "Resources": {
+    "IPAddress": {
+      "Type": "AWS::EC2::EIP",
+      "Properties": {
+        "Domain": "vpc",
+        "InstanceId": { "Ref": "BastionInstance" }
+      }
+    },
+    "IAMUser": {
+      "Type": "AWS::IAM::User",
+      "Properties": {
+        "Path": "/servers/management/bastioninstance/"
+      }
+    },
+
+    "AWSAccessKey": {
+      "Type": "AWS::IAM::AccessKey",
+      "Properties": {
+        "UserName": {"Ref": "IAMUser"}
+      }
+    },
+
+    "ManagementInstancesGroup": {
+      "Type": "AWS::IAM::Group",
+      "Properties": {
+        "Path": "/servers/management/"
+      }
+    },
+
+    "AddManagementInstancesGroup": {
+      "Type": "AWS::IAM::UserToGroupAddition",
+      "Properties": {
+        "GroupName": { "Ref": "ManagementInstancesGroup" },
+        "Users": [ { "Ref": "IAMUser" } ]
+      }
+    },
+
+    "SecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "VpcId": {"Ref": "VPC" },
+        "GroupDescription": "Enable secure access to the bastion server",
+        "SecurityGroupIngress": [
+          { "IpProtocol": "tcp", "FromPort": "22", "ToPort": "22", "CidrIp": "0.0.0.0/0" },
+          { "IpProtocol": "tcp", "FromPort": "443", "ToPort": "443", "CidrIp": "0.0.0.0/0" },
+          { "IpProtocol": "udp", "FromPort": "1194", "ToPort": "1194", "CidrIp": "0.0.0.0/0" },
+          { "IpProtocol": "tcp", "FromPort": "3128", "ToPort": "3128", "CidrIp": {"Ref": "WebServerNetwork" } },
+          { "IpProtocol": "tcp", "FromPort": "3128", "ToPort": "3128", "CidrIp": {"Ref": "DBServerNetwork" } }
+         ]
+      }
+    },
+
+    "BastionInstance": {
+      "Type": "AWS::EC2::Instance",
+      "Properties": {
+        "ImageId": {"Fn::FindInMap": [ "RegionArch2AMI", { "Ref": "AWS::Region" }, {"Fn::FindInMap": [ "InstanceType2Arch", { "Ref": "InstanceType" }, "Arch" ] } ] },
+        "SecurityGroupIds": [{ "Ref": "SecurityGroup" }],
+        "SubnetId": { "Ref": "PublicNetworkID" },
+        "SourceDestCheck": "false",
+        "InstanceType": { "Ref": "InstanceType" },
+        "UserData": {"Fn::Base64": {"Fn::Join": ["", [
+            "#!/bin/bash\n",
+
+            "set -e -x\n",
+            "export CHEF_RDIR='/usr/local/share/chef-solo'\n",
+            "signalid=$RANDOM\n",
+            "function error_exit\n",
+            "{\n",
+            "  date +%s\n",
+            "  cfn-signal -e 1 -r \"$1\" '", { "Ref": "WaitHandle" }, "'\n",
+            "  exit 1\n",
+            "}\n",
+
+            "function signal_success\n",
+            "{\n",
+            "  date +%s\n",
+            "  cfn-signal -e 0 -d \"$1\" -i \"$((signalid++))\" '", { "Ref": "WaitHandle" }, "'\n",
+            "}\n",
+
+            "export DEBIAN_FRONTEND=noninteractive\n",
+            "apt-get --yes --quiet install python-setuptools || error_exit 'Failed to install python-setuptools'\n",
+            "easy_install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-1.0-6.tar.gz || error_exit 'Failed to install CFN scripts'\n",
+            "signal_success 'Bastion initialization - CFN'\n",
+            "cat << EOF >> /home/ubuntu/.s3cfg\n",
+            "[default]\n",
+            "access_key = ", { "Ref": "AWSAccessKey" }, "\n",
+            "secret_key = ", {"Fn::GetAtt": [ "AWSAccessKey", "SecretAccessKey" ] }, "\n",
+            "use_https = True\n",
+            "EOF\n",
+            "echo \"deb http://apt.opscode.com/ `lsb_release -cs`-0.10 main\" | tee /etc/apt/sources.list.d/opscode.list\n",
+            "gpg --keyserver keys.gnupg.net --recv-keys 83EF826A || gpg --keyserver pgp.mit.edu --recv-keys 83EF826A || error_exit 'Failed to obtain opscode PGP key'\n",
+            "gpg --export packages@opscode.com > /etc/apt/trusted.gpg.d/opscode-keyring.gpg\n",
+            "apt-get --yes --quiet update || error_exit 'Failed to update APT listing'\n",
+            "echo \"chef chef/chef_server_url string none\" | debconf-set-selections\n",
+            "apt-get --quiet --yes install opscode-keyring chef || error_exit 'Failed to install chef and opscode-keyring'\n",
+            "signal_success 'Bastion initialization - Chef installation'\n",
+            "apt-get --yes --quiet upgrade\n",
+            "apt-get --yes --quiet install git-core ssl-cert s3cmd rake || error_exit 'Failed to install git'\n",
+            "cat << EOF > /etc/chef/solo.rb\n",
+            "log_level :info\n",
+            "log_location STDOUT\n",
+            "file_cache_path \"$CHEF_RDIR\"\n",
+            "cookbook_path \"$CHEF_RDIR/cookbooks\"\n",
+            "data_bag_path \"$CHEF_RDIR/data_bags\"\n",
+            "json_attribs \"/etc/chef/node.json\"\n",
+            "EOF\n",
+            "cat << EOF > /etc/chef/node.json\n",
+            "{\n\t\"openvpn\": {\n",
+            "\t\t\"script_security\":\"2\",\n",
+            "\t\t\"subnet\":\"", {"Ref": "VPNNetworkAddress" }, "\",\n",
+            "\t\t\"netmask\":\"255.255.254.0\",\n",
+            "\t\t\"routes\": [ \"push 'route ", {"Ref": "ServersNetwork"}, "'\" ],\n",
+            "\t\t\"tls-auth\":\"ta.key\",\n",
+            "\t\t\"gateway\":\"ovpn.", { "Ref": "Domain" }, "\",\n",
+            "\t\t\"key\": {\n",
+            "\t\t\t\"ca_expire\":\"2920\",\n",
+            "\t\t\t\"expire\":\"1825\",\n",
+            "\t\t\t\"country\":\"ES\",\n",
+            "\t\t\t\"province\":\"Barcelona\",\n",
+            "\t\t\t\"city\":\"Barcelona\",\n",
+            "\t\t\t\"org\":\"FXAcction Ltd\",\n",
+            "\t\t\t\"email\":\"admin_AT_gmail.com\"\n",
+            "\t\t}\n",
+            "\t},\n",
+            "\t\"users\": [\"elewis\", \"zorlem\"],\n",
+            "\t\"run_list\": [\"recipe[squid]\",\"recipe[openvpn]\",\"recipe[user::data_bag]\"]\n}\n",
+            "EOF\n",
+            "chmod 600 /etc/chef/node.json\n",
+            "git clone -b sulfur-project ", {"Ref": "ChefRepo"}, " $CHEF_RDIR >> /tmp/bootscript.log || error_exit 'Failed to install chef skeleton'\n",
+            "(cd $CHEF_RDIR && git checkout -b master origin/sulfur-project)\n", 
+            "update-rc.d chef-client disable\n",
+            "service chef-client stop\n",
+            "knife cookbook site install squid --cookbook-path $CHEF_RDIR/cookbooks >>/tmp/bootscript.log || error_exit 'Failed to install squid cookbook'\n",
+            "mkdir -p $CHEF_RDIR/data_bags/{squid_acls,squid_hosts,users}\n",
+            "echo '{\n  \"id\": \"webnet\",\n  \"acl\": [\n    [ \"ports\", \"allow\" ]\n    ]\n}' > $CHEF_RDIR/data_bags/squid_acls/webnet.json\n",
+            "echo '{\n  \"id\": \"dbnet\",\n  \"acl\": [\n    [ \"ports\", \"allow\" ]\n    ]\n}' > $CHEF_RDIR/data_bags/squid_acls/dbnet.json\n",
+            "echo '{\n  \"type\": \"port\",\n  \"id\": \"ports\",\n  \"net\": [ \"80\", \"443\", \"4000\", \"11371\" ]\n}' > $CHEF_RDIR/data_bags/squid_hosts/ports.json\n",
+            "echo '{\n  \"type\": \"src\",\n  \"id\": \"webnet\",\n  \"net\": [ \"", {"Ref": "WebServerNetwork"}, "\" ]\n}' > $CHEF_RDIR/data_bags/squid_hosts/webnet.json\n",
+            "echo '{\n  \"type\": \"src\",\n  \"id\": \"dbnet\",\n  \"net\": [ \"", {"Ref": "DBServerNetwork"}, "\" ]\n}' > $CHEF_RDIR/data_bags/squid_hosts/dbnet.json\n",
+            "cat << EOF >> $CHEF_RDIR/data_bags/users/zorlem.json\n",
+            "{\n\"id\": \"zorlem\",\n",
+            "\"comment\": \"Hristo Erinin\",\n",
+	    "\"ssh_keygen\": \"no\",\n",
+            "\"ssh_keys\": [\n",
+            "\"ssh-rsa AAAAB3NzaC........ zorlem-greend\",\n",
+            "\"ssh-dss AAAAB3NzaC........ zorlem-angst\"\n",
+            "]\n}\n",
+            "EOF\n",
+            "cat << EOF >> $CHEF_RDIR/data_bags/users/sulfur-users.json\n",
+            "{\n\"id\": \"genadmin\",\n",
+            "\"comment\": \"Generic account for the website\",\n",
+	    "\"ssh_keygen\": \"no\",\n",
+            "\"ssh_keys\": [\n",
+            "\"ssh-rsa AAAAB3NzaC........ zorlem-greend\",\n",
+            "\"ssh-dss AAAAB3NzaC........ zorlem-angst\"\n",
+            "]\n}\n",
+            "EOF\n",
+            "cat << EOF >> $CHEF_RDIR/data_bags/users/elewis.json\n",
+            "{\n\"id\": \"elewis\",\n",
+            "\"comment\": \"Edward Lewis\",\n",
+	    "\"ssh_keygen\": \"no\",\n",
+            "\"ssh_keys\": [\n",
+            "\"ssh-rsa AAAAB3NzaC........ zorlem-greend\",\n",
+            "\"ssh-dss AAAAB3NzaC........ zorlem-angst\"\n",
+            "]\n}\n",
+            "EOF\n",
+            "chef-solo >> /tmp/bootscript.log || error_exit 'Failed to run chef-solo, output is available in /tmp/bootscript.log'\n",
+            "signal_success 'Bastion initialization - Chef configuration complete'\n",
+            "echo Success\n"
+        ]]}},
+
+        "KeyName": { "Ref": "KeyName" },
+        "Tags": [ 
+          {"Key": "Application", "Value": { "Ref": "StackName"} },
+          {"Key": "Environment", "Value": { "Ref": "Environment"} },
+          {"Key": "ServerRole", "Value": "Bastion" },
+          {"Key": "Network", "Value": "Public" }
+        ]
+      }
+    },
+
+    "WaitHandle": {
+      "Type": "AWS::CloudFormation::WaitConditionHandle"
+    },
+
+    "WaitCondition": {
+      "Type": "AWS::CloudFormation::WaitCondition",
+      "DependsOn": "BastionInstance",
+      "Properties": {
+        "Handle": {"Ref": "WaitHandle"},
+        "Timeout": "540",
+        "Count": "3"
+      }
+    }
+  },
+  
+  "Outputs": {
+
+    "ServerIP": {
+      "Value": {"Fn::GetAtt": ["BastionInstance", "PublicIp"] },
+      "Description": "The IP address of the Bastion server."
+    },
+
+    "WaitHandle": {
+      "Value": {"Ref": "WaitHandle" },
+      "Description": "The IP address of the Bastion server."
+    },
+
+    "SecurityGroup": {
+      "Value": {"Ref": "SecurityGroup" },
+      "Description": "The SG of the Bastion server."
+    },
+
+    "InstanceID": {
+      "Value": {"Ref": "BastionInstance"},
+      "Description": "The instance ID of the Bastion server."
+    },
+
+    "PrivateIP": {
+      "Value": {"Fn::GetAtt": ["BastionInstance", "PrivateIp"] },
+      "Description": "The IP address of the Bastion server."
+    }
+  }
+}

@@ -1,0 +1,341 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+
+  "Description": "This template creates a VPC with private and public subnets. It also creates two EC2 instances - one in the private subnet designated as a server and another, in the public subnet, designated as a Proxy/NAT box and SSH bastion. The public EC2 instance is assigned an Elastic IP address and a security group.",
+
+  "Parameters": {
+    "BastionInstanceType": {
+      "Description": "Bastion Server EC2 instance type",
+      "Type": "String",
+      "Default": "m1.small",
+      "AllowedValues": [ "t1.micro","m1.small","m1.medium","m1.large","m1.xlarge","m2.xlarge","m2.2xlarge","m2.4xlarge","c1.medium","c1.xlarge","cc1.4xlarge","cc2.8xlarge","cg1.4xlarge"],
+      "ConstraintDescription": "must be a valid EC2 instance type. running a t1.micro inside a VPC is unsupported by AWS at the moment!"
+    },
+
+    "WebInstanceType": {
+      "Description": "Web Server EC2 instance type",
+      "Type": "String",
+      "Default": "m1.small",
+      "AllowedValues": [ "t1.micro","m1.small","m1.medium","m1.large","m1.xlarge","m2.xlarge","m2.2xlarge","m2.4xlarge","c1.medium","c1.xlarge","cc1.4xlarge","cc2.8xlarge","cg1.4xlarge"],
+      "ConstraintDescription": "must be a valid EC2 instance type. running a t1.micro inside a VPC is unsupported by AWS at the moment!"
+    },
+
+    "WebDataVolumeSize" : {
+      "Description" : "Web Server data size (in GB). Due to RAID1 the actual available space will be 1/2 of the specified here.",
+      "Type" : "Number",
+      "Default" : "1",
+      "MinValue" : "1",
+      "MaxValue" : "1024",
+      "ConstraintDescription" : "must be between 1GB and 1024GB."
+    },
+
+    "DBInstanceType": {
+      "Description": "Database Server EC2 instance type",
+      "Type": "String",
+      "Default": "m1.small",
+      "AllowedValues": [ "t1.micro","m1.small","m1.medium","m1.large","m1.xlarge","m2.xlarge","m2.2xlarge","m2.4xlarge","c1.medium","c1.xlarge","cc1.4xlarge","cc2.8xlarge","cg1.4xlarge"],
+      "ConstraintDescription": "must be a valid EC2 instance type. running a t1.micro inside a VPC is unsupported by AWS at the moment!"
+    },
+
+    "DBDataVolumeSize" : {
+      "Description" : "Data size of the volumes for SQL (RAID10) and Binary Logs (RAID1) (in GB). Due to RAID1 and RAID10 the actual available space will be 1/2 of the specified here.",
+      "Type" : "Number",
+      "Default" : "1",
+      "MinValue" : "1",
+      "MaxValue" : "1024",
+      "ConstraintDescription" : "must be between 1GB and 1024GB."
+    },
+
+    "KeyName": {
+      "Description": "KeyPair for SSH access to the instances. It must exist.",
+      "Type": "String"
+    },
+
+    "Environment": {
+      "Description": "The name of the environment for this stack",
+      "Type": "String",
+      "Default": "production",
+      "AllowedValues": ["production", "staging", "development" ],
+      "ConstraintDescription": "must be one of production, staging or development"
+    },
+
+    "S3Bucket" : {
+      "Description" : "An S3 Bucket containing private files",
+      "Type" : "String",
+      "Default" : "sulfur-private"
+    },
+    
+    "Domain": {
+      "Description": "The domain name for this stack. This should be a valid domain registered in Route 53. Do NOT put a trailing '.'",
+      "Type": "String",
+      "Default": "sulfur.erinin.net",
+      "MinLength": "4",
+      "MaxLength": "92",
+      "AllowedPattern": "^[a-z0-9\\.-]{4,}[^\\.]$" 
+    },
+    
+    "ChefRepo": {
+      "Description": "The Git repository that holds the chef recipes. At the moment this must be a public repository, a method for authentication is not provisioned yet.",
+      "Type": "String",
+      "Default": "https://github.com/zorlem/chef-cookbooks-repo.git",
+      "MinLength": "10",
+      "AllowedPattern": "^(http|https|git)://.*" 
+    }
+  },
+
+  "Mappings": {
+
+    "Region2S3Bucket": {
+      "us-east-1"      : { "s3bucket" : "https://s3-us-east-1.amazonaws.com/cf-templates-50la4ncl8fi9-us-east-1" },
+      "eu-west-1"      : { "s3bucket" : "https://s3-eu-west-1.amazonaws.com/cf-templates-50la4ncl8fi9-eu" }
+    },
+    "Env2VPNNet": {
+      "production": { "vpnnet": "10.82.4.0/23", "vpnnetaddress": "10.82.4.0" },
+      "development": { "vpnnet": "10.82.8.0/23", "vpnnetaddress": "10.82.8.0" },
+      "staging": { "vpnnet": "10.82.16.0/23", "vpnnetaddress": "10.82.16.0" }
+    },
+    "Env2Domain": {
+      "production": { "domain": "" },
+      "development": { "domain": "dev." },
+      "staging": { "domain": "pre." }
+    }
+  },
+
+  "Resources": {
+    "VPC": {
+      "Type" : "AWS::CloudFormation::Stack",
+      "Metadata": {
+        "Comment": "Creates the VPC elements"
+      },
+      "Properties": {
+        "TemplateURL": {"Fn::Join" : ["/", [{"Fn::FindInMap": ["Region2S3Bucket", {"Ref": "AWS::Region" }, "s3bucket" ]},
+                          "sulfur-phase2.vpc.template.json" ]]},
+        "Parameters": {
+          "Environment": {"Ref": "Environment" },
+          "Domain": {"Fn::Join": ["", [{"Fn::FindInMap": [ "Env2Domain", {"Ref": "Environment"}, "domain"]} , {"Ref": "Domain" }]]},
+          "StackName": {"Ref": "AWS::StackName"}
+        }
+      }
+    },
+
+   
+    "Bastion": {
+      "Type" : "AWS::CloudFormation::Stack",
+      "Metadata": {
+        "Comment": "Creates a Bastion Instance"
+      },
+      "Properties": {
+        "TemplateURL": {"Fn::Join" : ["/", [{"Fn::FindInMap": ["Region2S3Bucket", {"Ref": "AWS::Region" }, "s3bucket" ]},
+                          "sulfur-phase2.bastion.template.json" ]]},
+        "Parameters": {
+          "Environment": {"Ref": "Environment" },
+          "KeyName": {"Ref": "KeyName" },
+          "InstanceType": {"Ref": "BastionInstanceType" },
+          "Domain": {"Fn::Join": ["", [{"Fn::FindInMap": [ "Env2Domain", {"Ref": "Environment"}, "domain"]} , {"Ref": "Domain" }]]},
+          "StackName": {"Ref": "AWS::StackName"},
+          "PublicNetworkID": {"Fn::GetAtt": [ "VPC", "Outputs.PublicSubnetID" ]},
+          "VPC": { "Fn::GetAtt": [ "VPC", "Outputs.VPC"]},
+          "VPNNetworkAddress": {"Fn::FindInMap": [ "Env2VPNNet", { "Ref": "Environment" }, "vpnnetaddress" ] },
+          "WebServerNetwork": {"Fn::GetAtt": [ "VPC", "Outputs.WebServerNetwork" ]},
+          "DBServerNetwork": {"Fn::GetAtt": [ "VPC", "Outputs.DBServerNetwork" ]},
+          "ServersNetwork": {"Fn::GetAtt": [ "VPC", "Outputs.ServersNetwork" ]},
+          "ChefRepo": {"Ref": "ChefRepo"}
+        }
+      }
+    },
+
+    "Web": {
+      "Type" : "AWS::CloudFormation::Stack",
+      "Metadata": {
+        "Comment": "Creates Web Server Instances"
+      },
+      "Properties": {
+        "TemplateURL": {"Fn::Join" : ["/", [{"Fn::FindInMap": ["Region2S3Bucket", {"Ref": "AWS::Region" }, "s3bucket" ]},
+                          "sulfur-phase2.web.template.json" ]]},
+        "Parameters": {
+          "KeyName": {"Ref": "KeyName" },
+          "InstanceType": {"Ref": "WebInstanceType" },
+          "Environment": {"Ref": "Environment" },
+          "StackName": {"Ref": "AWS::StackName"},
+          "VPC": { "Fn::GetAtt": [ "VPC", "Outputs.VPC"]},
+          "NetworkID": {"Fn::GetAtt": [ "VPC", "Outputs.WebSubnetID" ]},
+          "DataVolumeSize": {"Ref": "WebDataVolumeSize"},
+          "S3Bucket": {"Ref": "S3Bucket"},
+          "VPNNetwork": {"Fn::FindInMap": [ "Env2VPNNet", { "Ref": "Environment" }, "vpnnet" ] },
+          "BastionInstanceIP": {"Fn::GetAtt": [ "Bastion", "Outputs.PrivateIP" ] },
+          "ChefRepo": {"Ref": "ChefRepo"}
+        }
+      }
+    },
+
+    "BastionSSH2WebSG": { 
+      "Type": "AWS::EC2::SecurityGroupIngress",
+      "Properties": {
+        "GroupId": {"Fn::GetAtt": [ "Web", "Outputs.SecurityGroup" ] },
+        "IpProtocol": "tcp", 
+        "FromPort": "22", 
+        "ToPort": "22", 
+        "SourceSecurityGroupId": {"Fn::GetAtt": [ "Bastion", "Outputs.SecurityGroup" ] } 
+      }
+    },
+
+    "WebLB": {
+      "Type" : "AWS::CloudFormation::Stack",
+      "Metadata": {
+        "Comment": "Creates an Elastic Load Balancer for the Web servers"
+      },
+      "Properties": {
+        "TemplateURL": {"Fn::Join" : ["/", [{"Fn::FindInMap": ["Region2S3Bucket", {"Ref": "AWS::Region" }, "s3bucket" ]},
+                          "sulfur-phase2.webelb.template.json" ]]},
+        "Parameters": {
+          "Environment": {"Ref": "Environment" },
+          "LBSubnet": {"Fn::GetAtt": [ "VPC", "Outputs.WebELBSubnet" ]},
+          "VPC": { "Fn::GetAtt": [ "VPC", "Outputs.VPC"]},
+          "WebInstance": {"Fn::GetAtt": [ "Web", "Outputs.InstanceID" ]}
+        }
+      }
+    },
+
+    "WebLBHTTP2WebSG": { 
+      "Type": "AWS::EC2::SecurityGroupIngress",
+      "Properties": {
+        "GroupId": {"Fn::GetAtt": [ "Web", "Outputs.SecurityGroup" ]},
+        "IpProtocol": "tcp",
+        "FromPort": "80",
+        "ToPort": "80",
+        "SourceSecurityGroupId": {"Fn::GetAtt": [ "WebLB", "Outputs.SecurityGroup" ]}
+      }
+    },
+
+    "WebLBHTTPS2WebSG": {
+      "Type": "AWS::EC2::SecurityGroupIngress",
+      "Properties": {
+        "GroupId": {"Fn::GetAtt": [ "Web", "Outputs.SecurityGroup" ]},
+        "IpProtocol": "tcp",
+        "FromPort": "443",
+        "ToPort": "443",
+        "SourceSecurityGroupId": {"Fn::GetAtt": [ "WebLB", "Outputs.SecurityGroup" ]}
+      }
+    },
+
+    "Database": {
+      "Type" : "AWS::CloudFormation::Stack",
+      "Metadata": {
+        "Comment": "Creates Web Server Instances"
+      },
+      "Properties": {
+        "TemplateURL": {"Fn::Join" : ["/", [{"Fn::FindInMap": ["Region2S3Bucket", {"Ref": "AWS::Region" }, "s3bucket" ]},
+                          "sulfur-phase2.db.template.json" ]]},
+        "Parameters": {
+          "KeyName": {"Ref": "KeyName" },
+          "InstanceType": {"Ref": "DBInstanceType" },
+          "Environment": {"Ref": "Environment" },
+          "StackName": {"Ref": "AWS::StackName"},
+          "VPC": { "Fn::GetAtt": [ "VPC", "Outputs.VPC"]},
+          "NetworkID": {"Fn::GetAtt": [ "VPC", "Outputs.DBSubnetID" ]},
+          "DataVolumeSize": {"Ref": "DBDataVolumeSize"},
+          "S3Bucket": {"Ref": "S3Bucket"},
+          "VPNNetwork": {"Fn::FindInMap": [ "Env2VPNNet", { "Ref": "Environment" }, "vpnnet" ] },
+          "BastionInstanceIP": {"Fn::GetAtt": [ "Bastion", "Outputs.PrivateIP" ] },
+          "ChefRepo": {"Ref": "ChefRepo"}
+        }
+      }
+    },
+
+    "BastionSSH2DatabaseSG": { 
+      "Type": "AWS::EC2::SecurityGroupIngress",
+      "Properties": {
+        "GroupId": {"Fn::GetAtt": [ "Database", "Outputs.SecurityGroup" ] },
+        "IpProtocol": "tcp", 
+        "FromPort": "22", 
+        "ToPort": "22", 
+        "SourceSecurityGroupId": {"Fn::GetAtt": [ "Bastion", "Outputs.SecurityGroup" ] } 
+      }
+    },
+
+    "WebMySQL2DatabaseSG": { 
+      "Type": "AWS::EC2::SecurityGroupIngress",
+      "Properties": {
+        "GroupId": {"Fn::GetAtt": [ "Database", "Outputs.SecurityGroup" ] },
+        "IpProtocol": "tcp", 
+        "FromPort": "3306", 
+        "ToPort": "3306", 
+        "SourceSecurityGroupId": {"Fn::GetAtt": [ "Web", "Outputs.SecurityGroup" ] } 
+      }
+    },
+    "VPN": {
+      "Type" : "AWS::CloudFormation::Stack",
+      "Metadata": {
+        "Comment": "Creates various routings for the VPN network"
+      },
+      "Properties": {
+        "TemplateURL": {"Fn::Join" : ["/", [{"Fn::FindInMap": ["Region2S3Bucket", {"Ref": "AWS::Region" }, "s3bucket" ]},
+                          "sulfur-phase2.vpn.template.json" ]]},
+        "Parameters": {
+          "Environment": {"Ref": "Environment" },
+          "VPNNetwork": {"Fn::FindInMap": [ "Env2VPNNet", { "Ref": "Environment" }, "vpnnet" ] },
+          "BastionInstance": {"Fn::GetAtt": [ "Bastion", "Outputs.InstanceID" ] },
+          "WebRouteTable": {"Fn::GetAtt": [ "VPC", "Outputs.WebRouteTable" ] },
+          "DBRouteTable": {"Fn::GetAtt": [ "VPC", "Outputs.DBRouteTable" ] }
+        }
+      }
+    },
+    "Hostnames": {
+      "Type" : "AWS::CloudFormation::Stack",
+      "Metadata": {
+        "Comment": "Creates various hostnames for the instances in this stack"
+      },
+      "Properties": {
+        "TemplateURL": {"Fn::Join" : ["/", [{"Fn::FindInMap": ["Region2S3Bucket", {"Ref": "AWS::Region" }, "s3bucket" ]},
+                          "sulfur-phase2.hostnames.template.json" ]]},
+        "Parameters": {
+          "ZoneName": {"Fn::Join": ["", [{"Ref": "Domain"}, "."]]},
+          "Domain": {"Fn::Join": ["", [{"Fn::FindInMap": [ "Env2Domain", {"Ref": "Environment"}, "domain"]} , {"Ref": "Domain" }, "."]]},
+          "WebLBHostedZoneID": {"Fn::GetAtt": [ "WebLB", "Outputs.LBHostedZoneID" ] },
+          "WebLBAddress": {"Fn::GetAtt": [ "WebLB", "Outputs.LBAddress" ] },
+          "BastionPublicIP": {"Fn::GetAtt": [ "Bastion", "Outputs.ServerIP" ] },
+          "WebPrivateIP": {"Fn::GetAtt": [ "Web", "Outputs.ServerIP" ] },
+          "DBPrivateIP": {"Fn::GetAtt": [ "Database", "Outputs.ServerIP" ] }
+        }
+      }
+    }
+  },
+  "Outputs": {
+    "WebServerIP": {
+      "Value": {"Fn::GetAtt": [ "Web", "Outputs.ServerIP" ]},
+      "Description": "Internal IP address of the Web server"
+    },
+    "BastionExternalIP": {
+      "Value": {"Fn::GetAtt": [ "Bastion", "Outputs.ServerIP" ]},
+      "Description": "External IP address of the Bastion server"
+    },
+    "DatabaseServerIP": {
+      "Value": {"Fn::GetAtt": [ "Database", "Outputs.ServerIP" ]},
+      "Description": "Internal IP address of the DB server"
+    },
+    "PublicWebHostname": {
+      "Value": {"Fn::GetAtt": [ "Hostnames", "Outputs.PublicWebHostname" ]},
+      "Description": "Hostname of the Web server"
+    },
+    "WebServerHostname": {
+      "Value": {"Fn::GetAtt": [ "Hostnames", "Outputs.WebServerHostname" ]},
+      "Description": "Hostname of the Web server"
+    },
+    "DBHostname": {
+      "Value": {"Fn::GetAtt": [ "Hostnames", "Outputs.DBServerHostname" ]},
+      "Description": "Hostname of the DB server"
+    },
+    "OpenVPNHostname": {
+      "Value": {"Fn::GetAtt": [ "Hostnames", "Outputs.OpenVPNHostname" ]},
+      "Description": "Hostname of the OpenVPN server"
+    },
+    "VPNNetwork": {
+      "Value": {"Fn::GetAtt": [ "VPN", "Outputs.VPNNetwork" ]},
+      "Description": "The network assigned for VPN access"
+    },
+    "WebLBAddress": {
+      "Value": {"Fn::GetAtt": [ "WebLB", "Outputs.LBAddress" ]},
+      "Description": "Hostname of the Loadbalancer"
+    }
+  }
+}

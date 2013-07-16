@@ -1,0 +1,138 @@
+{ 
+  "AWSTemplateFormatVersion": "2010-09-09",
+
+  "Description": "This template creates the hostname association to various resources in a stack. It also creates several hostnames used for convenience when addressing the servers. This template is intended to be used as an embedded stack.",
+
+  "Parameters": {
+    "ZoneName": {
+      "Description": "The name of the zone in Route 53 for this stack, ending with a dot.",
+      "Type": "String",
+      "MinLength": "4",
+      "MaxLength": "93",
+      "AllowedPattern": "[a-z0-9\\.-]{4,92}\\.$" 
+    },
+    "Domain": {
+      "Description": "The domain name for this stack ending with a dot.",
+      "Type": "String",
+      "MinLength": "4",
+      "MaxLength": "100",
+      "AllowedPattern": "[a-z0-9\\.-]{4,99}\\.$" 
+    },
+    "WebLBHostedZoneID": {
+      "Description": "The canonical name of the zone of Web ELB",
+      "Type": "String",
+      "MinLength": "1",
+      "MaxLength": "128"
+    },
+    "WebLBAddress": {
+      "Description": "The hostname of the Web ELB",
+      "Type": "String",
+      "MinLength": "1",
+      "MaxLength": "128"
+    },
+    "BastionPublicIP": {
+      "Description": "The public IP address of the Bastion instance",
+      "Type": "String",
+      "MinLength": "9",
+      "MaxLength": "23",
+      "AllowedPattern": "\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}" 
+    },
+    "WebPrivateIP": {
+      "Description": "The private IP address of the web server instance",
+      "Type": "String",
+      "MinLength": "9",
+      "MaxLength": "23",
+      "AllowedPattern": "\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}" 
+    },
+    "DBPrivateIP": {
+      "Description": "The private IP address of the Database server instance",
+      "Type": "String",
+      "MinLength": "9",
+      "MaxLength": "23",
+      "AllowedPattern": "\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}" 
+    }
+  },
+  "Resources": {
+    "PublicWebHostnames": {
+      "Type": "AWS::Route53::RecordSetGroup",
+      "Properties": {
+        "HostedZoneName": {"Ref": "ZoneName" },
+        "Comment": "zone apex and the www pointing to the Web LB",
+        "RecordSets": [ {
+            "Name": {"Ref": "Domain" },
+            "Type": "A",
+            "AliasTarget": {
+              "HostedZoneId": {"Ref": "WebLBHostedZoneID"},
+              "DNSName": {"Ref": "WebLBAddress"}
+            }
+          },
+          {
+            "Name": {"Fn::Join": [".", [ "www", {"Ref": "Domain" } ]]},
+            "Type": "A",
+            "AliasTarget": {
+              "HostedZoneId": {"Ref": "WebLBHostedZoneID" },
+              "DNSName": {"Ref": "WebLBAddress" }
+            }
+          } ]
+      }
+    },
+    "BastionHostnames": {
+      "Type": "AWS::Route53::RecordSetGroup",
+      "Properties": {
+        "HostedZoneName": {"Ref": "ZoneName"},
+        "Comment": "hostnames for ovpn and bastion pointing to the bastion box",
+        "RecordSets": [ {
+            "Name": {"Fn::Join": [".", [ "ovpn",  {"Ref": "Domain"} ]]},
+            "Type": "A",
+            "TTL": "900",
+            "ResourceRecords": [ {"Ref": "BastionPublicIP"} ]
+          }, {
+            "Name": { "Fn::Join": [".", [ "bastion",  {"Ref": "Domain"} ]]},
+            "Type": "A",
+            "TTL": "900",
+            "ResourceRecords": [ {"Ref": "BastionPublicIP"} ]
+          } ]
+      }
+    },
+    "WebServerHostname": {
+      "Type": "AWS::Route53::RecordSet",
+      "Properties": {
+        "HostedZoneName": {"Ref": "ZoneName" },
+        "Comment": "short hostnames for web servers",
+        "Name": {"Fn::Join": [".", [ "w1",  {"Ref": "Domain" } ]]},
+        "Type": "A",
+        "TTL": "900",
+        "ResourceRecords": [ {"Ref": "WebPrivateIP"} ]
+      }
+    },
+    "DBServerHostname": {
+      "Type": "AWS::Route53::RecordSet",
+      "Properties": {
+        "HostedZoneName": {"Ref": "ZoneName" },
+        "Comment": "short hostnames for the database servers",
+        "Name": {"Fn::Join": [".", [ "d1",  {"Ref": "Domain" } ]] },
+        "Type": "A",
+        "TTL": "900",
+        "ResourceRecords": [ {"Ref": "DBPrivateIP"} ]
+      }
+    }
+  },
+  "Outputs": {
+    "OpenVPNHostname": {
+      "Value": {"Fn::Join": [".", [ "ovpn", {"Ref": "Domain" } ]] },
+      "Description": "Hostnames associated with the Bastion server."
+    },
+    "PublicWebHostname": {
+      "Value": {"Fn::Join": [".", [ "www", { "Ref": "Domain" } ]]},
+      "Description": "Hostnames associated with external Web Front-ends."
+    },
+    "WebServerHostname": {
+      "Value": {"Ref": "WebServerHostname" },
+      "Description": "Hostnames associated with Web instances."
+    },
+    "DBServerHostname": {
+      "Value": {"Ref": "DBServerHostname" },
+      "Description": "Hostnames associated with DB instances."
+    }
+  }
+}

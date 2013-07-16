@@ -1,0 +1,93 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+
+  "Description": "This template creates an Elastic Load Balancer instance for serving HTTP and HTTPS content from the Web hosts. The ELB has two listeners configured and terminated on the Web instances. One is for HTTP on port 80 and the other is for HTTPS (passthrough) to port 443. There is a basic health-check.",
+
+  "Parameters": {
+    "Environment": {
+      "Description": "The name of the environment for this stack",
+      "Type": "String",
+      "Default": "production",
+      "AllowedValues": ["production", "staging", "development" ],
+      "ConstraintDescription": "must be one of production, staging or development"
+    },
+    "LBSubnet": {
+      "Description": "The logical name of the subnet assigned to the LB",
+      "Type": "String",
+      "MinLength": "1",
+      "MaxLength": "128"
+    },
+    "VPC": {
+      "Description": "The name of the VPC in which the LB should spawn",
+      "Type": "String",
+      "MinLength": "1",
+      "MaxLength": "128"
+    },
+    "WebInstance": {
+      "Description": "The logical name of the web servers' instance",
+      "Type": "String",
+      "MinLength": "1",
+      "MaxLength": "128"
+    }
+  },
+
+  "Resources": {
+    "SecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "GroupDescription": "Enable access on ports 80 and 443 from the LB",
+        "VpcId": { "Ref": "VPC" },
+        "SecurityGroupIngress": [ 
+          { "IpProtocol": "tcp", "FromPort": "80", "ToPort": "80", "CidrIp": "0.0.0.0/0" },
+          { "IpProtocol": "tcp", "FromPort": "443", "ToPort": "443", "CidrIp": "0.0.0.0/0" } ],
+        "SecurityGroupEgress": [ 
+          { "IpProtocol": "tcp", "FromPort": "80", "ToPort": "80", "CidrIp": "0.0.0.0/0" },
+          { "IpProtocol": "tcp", "FromPort": "443", "ToPort": "443", "CidrIp": "0.0.0.0/0" } ]
+      }
+    },
+
+    "WebELB": {
+      "Type": "AWS::ElasticLoadBalancing::LoadBalancer",
+      "Properties": {
+        "Instances": [ { "Ref": "WebInstance" } ],
+        "Subnets": [ { "Ref": "LBSubnet" } ],
+        "SecurityGroups": [ {"Ref": "SecurityGroup" } ],
+        "Listeners": [ {
+            "LoadBalancerPort": "80",
+            "InstancePort": "80",
+            "Protocol": "HTTP"
+          },
+          {
+            "LoadBalancerPort": "443",
+            "InstancePort": "443",
+            "Protocol": "TCP"
+          } ],
+        "HealthCheck": {
+          "Target": "HTTP:80/",
+          "HealthyThreshold": "3",
+          "UnhealthyThreshold": "5",
+          "Interval": "30",
+          "Timeout": "5"
+        }
+      }
+    }
+  },
+  "Outputs": {
+    "SecurityGroup": { 
+      "Value": { "Ref": "SecurityGroup" },
+      "Description" : "The security group associated to the Web LB."
+    },
+    "InstanceID": {
+      "Value": {"Ref": "WebELB" },
+      "Description": "The ID of the Web ELB instance."
+    },
+    "LBHostedZoneID": { 
+      "Value": { "Fn::GetAtt" : [ "WebELB", "CanonicalHostedZoneNameID" ] },
+      "Description" : "The hostname assigned to the LB."
+    },
+    "LBAddress": { 
+      "Value": { "Fn::GetAtt" : ["WebELB", "DNSName"] },
+      "Description" : "The hostname assigned to the LB."
+    }
+  }
+}

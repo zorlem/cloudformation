@@ -1,0 +1,65 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+
+  "Description": "This template creates a routing entry for the VPN network in the routing tables of the DB and Web private networks.",
+
+  "Parameters": {
+    "Environment": {
+      "Description": "The name of the environment for this stack",
+      "Type": "String",
+      "Default": "production",
+      "AllowedValues": ["production", "staging", "development" ],
+      "ConstraintDescription": "must be one of production, staging or development"
+    },
+    "VPNNetwork": {
+      "Type": "String",
+      "MinLength": "11",
+      "MaxLength": "23",
+      "Description": "The network to be used by the VPN (must be in the private ranges).",
+      "AllowedPattern": "(10\\.\\d{1,3}|172\\.([12]\\d|3[01])|192\\.168)\\.\\d{1,3}\\.\\d{1,3}/\\d{1,2}" 
+    },
+    "BastionInstance": {
+      "Description": "The logical name of the bastion instance",
+      "Type": "String",
+      "MinLength": "1",
+      "MaxLength": "128"
+    },
+    "WebRouteTable": {
+      "Description": "The logical name of the web servers' routing table",
+      "Type": "String",
+      "MinLength": "1",
+      "MaxLength": "128"
+    },
+    "DBRouteTable": {
+      "Description": "The logical name of the database servers' routing table",
+      "Type": "String",
+      "MinLength": "1",
+      "MaxLength": "128"
+    }
+  },
+
+  "Resources": {
+    "Web2VPNRoute": {
+      "Type": "AWS::EC2::Route",
+      "Properties": {
+        "RouteTableId": { "Ref": "WebRouteTable" },
+        "DestinationCidrBlock": {"Ref": "VPNNetwork" },
+        "InstanceId": { "Ref": "BastionInstance" }
+      }
+    },
+    "DB2VPNRoute": {
+      "Type": "AWS::EC2::Route",
+      "Properties": {
+        "RouteTableId": { "Ref": "DBRouteTable" },
+        "DestinationCidrBlock": {"Ref": "VPNNetwork" },
+        "InstanceId": { "Ref": "BastionInstance" }
+      }
+    }
+  },
+  "Outputs": {
+    "VPNNetwork": {
+      "Value": {"Ref": "VPNNetwork"},
+      "Description": "Network assigned by the Bastion server"
+    }
+  }
+}

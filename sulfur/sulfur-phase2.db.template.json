@@ -1,0 +1,414 @@
+{
+  "AWSTemplateFormatVersion" : "2010-09-09",
+
+  "Description" : "This template creates a DB instance within a private network inside a VPC. The private EC2 instance is not assigned an Elastic IP address and needs a proxy server to communicate with hosts outside of the VPC. This is configured through UserData and environment variables.",
+
+  "Parameters" : {
+
+    "InstanceType" : {
+      "Description" : "DB Server EC2 instance type",
+      "Type" : "String",
+      "Default" : "m1.small",
+      "AllowedValues" : [ "t1.micro","m1.small","m1.medium","m1.large","m1.xlarge","m2.xlarge","m2.2xlarge","m2.4xlarge","c1.medium","c1.xlarge","cc1.4xlarge","cc2.8xlarge","cg1.4xlarge"],
+      "ConstraintDescription" : "must be a valid EC2 instance type."
+    },
+
+    "KeyName" : {
+      "Description" : "KeyPair for SSH access to the instances. It must exist.",
+      "Type" : "String"
+    },
+
+    "Environment" : {
+      "Description" : "The name of the environment for this stack",
+      "Type" : "String",
+      "Default" : "production",
+      "AllowedValues" : [ "production", "staging", "development"],
+      "ConstraintDescription" : "must be one of production, staging or development"
+    },
+
+    "StackName": {
+      "Description": "The name of the stack",
+      "Type": "String",
+      "MinLength": "1",
+      "MaxLength": "128"
+    },
+
+    "NetworkID": {
+      "Type": "String",
+      "MinLength": "4",
+      "MaxLength": "50",
+      "Description": "The Subnet ID to be used by the DB instances (must be a private network)."
+    },
+
+    "VPC": {
+      "Description": "The name of the VPC in which the server should spawn",
+      "Type": "String",
+      "MinLength": "1",
+      "MaxLength": "128"
+    },
+
+    "DataVolumeSize" : {
+      "Description" : "DB Server data size (in GB). Due to RAID1+0 the actual available space will be 1/2 of the specified here.",
+      "Type" : "Number",
+      "Default" : "1",
+      "MinValue" : "1",
+      "MaxValue" : "1024",
+      "ConstraintDescription" : "must be between 1GB and 1024GB."
+    },
+
+    "VPNNetwork": {
+      "Type": "String",
+      "MinLength": "11",
+      "MaxLength": "23",
+      "Description": "The network to be used by the VPN (must be in the private ranges).",
+      "AllowedPattern": "^(10\\.\\d{1,3}|172\\.([12]\\d|3[01])|192\\.168)\\.\\d{1,3}\\.\\d{1,3}/\\d{1,2}$" 
+    },
+
+    "BastionInstanceIP": {
+      "Description": "The internal IP address assigned to the Bastion Instance",
+      "Type": "String",
+      "MinLength": "1",
+      "MaxLength": "128"
+    },
+    "S3Bucket" : {
+      "Description" : "An S3 Bucket containing private files",
+      "Type" : "String",
+      "Default" : "sulfur-private"
+    },
+    "ChefRepo": {
+      "Description": "The Git repository that holds the chef recipes. At the moment this must be a public repository, a method for authentication is not provisioned yet.",
+      "Type": "String",
+      "Default": "https://github.com/zorlem/chef-cookbooks-repo.git",
+      "MinLength": "10",
+      "AllowedPattern": "^(http|https|git)://.*" 
+    }
+  },
+  "Mappings" : {
+    "RegionArch2AMI" : {
+      "us-east-1"      : { "32" : "ami-c5b202ac", "64" : "ami-c7b202ae" },
+      "us-west-1"      : { "32" : "ami-b988acfc", "64" : "ami-bb88acfe" },
+      "us-west-2"      : { "32" : "ami-184fc128", "64" : "ami-1a4fc12a" },
+      "eu-west-1"      : { "32" : "ami-534a4b27", "64" : "ami-5d4a4b29" },
+      "sa-east-1"      : { "32" : "ami-68c91075", "64" : "ami-6ac91077" },
+      "ap-southeast-1" : { "32" : "ami-923575c0", "64" : "ami-903575c2" },
+      "ap-northeast-1" : { "32" : "ami-8676ca87", "64" : "ami-8876ca89" }
+    },
+    "InstanceType2Arch" : {
+      "t1.micro"    : { "Arch" : "32" },
+      "m1.small"    : { "Arch" : "32" },
+      "m1.medium"   : { "Arch" : "64" },
+      "m1.large"    : { "Arch" : "64" },
+      "m1.xlarge"   : { "Arch" : "64" },
+      "m2.xlarge"   : { "Arch" : "64" },
+      "m2.2xlarge"  : { "Arch" : "64" },
+      "m2.4xlarge"  : { "Arch" : "64" },
+      "c1.medium"   : { "Arch" : "64" },
+      "c1.xlarge"   : { "Arch" : "64" }
+    }
+  },
+  "Resources" : {
+    "IAMUser" : {
+      "Type" : "AWS::IAM::User",
+      "Properties" : {
+        "Path" : "/servers/content/database/"
+      }
+    },
+    "AWSAccessKey" : {
+      "Type" : "AWS::IAM::AccessKey",
+      "Properties" : {
+        "UserName" : {"Ref": "IAMUser"}
+      }
+    },
+
+    "DBInstancesGroup" : {
+      "Type" : "AWS::IAM::Group",
+      "Properties" : {
+        "Path" : "/servers/content/database/"
+      }
+    },
+
+    "DB2DBInstancesGroup" : {
+      "Type" : "AWS::IAM::UserToGroupAddition",
+      "Properties" : {
+        "GroupName" : { "Ref" : "DBInstancesGroup" },
+        "Users" : [ { "Ref" : "IAMUser" } ]
+      }
+    },
+
+    "SecurityGroup" : {
+      "Type" : "AWS::EC2::SecurityGroup",
+      "Properties" : {
+        "VpcId" : { "Ref" : "VPC" },
+        "GroupDescription" : "Enable secure access to the DB server",
+        "SecurityGroupIngress" : [
+          { "IpProtocol": "tcp", "FromPort": "22", "ToPort": "22", "CidrIp": { "Ref": "VPNNetwork"} },
+          { "IpProtocol": "tcp", "FromPort": "3306", "ToPort": "3306", "CidrIp": { "Ref": "VPNNetwork"} }
+         ]
+      }
+    },
+
+    "DBServerInstance" : {
+      "Type" : "AWS::EC2::Instance",
+      "Properties" : {
+        "ImageId" : { "Fn::FindInMap": [ "RegionArch2AMI", { "Ref": "AWS::Region" }, { "Fn::FindInMap": [ "InstanceType2Arch", { "Ref": "InstanceType" }, "Arch" ] } ] },
+        "SecurityGroupIds" : [{ "Ref" : "SecurityGroup" }],
+        "SubnetId" : { "Ref" : "NetworkID" },
+        "InstanceType" : { "Ref" : "InstanceType" },
+        "UserData" : { "Fn::Base64" : { "Fn::Join" : ["", [
+            "#!/bin/bash\n",
+
+            "set -e -x\n",
+            "export CHEF_RDIR='/usr/local/share/chef-solo'\n",
+            "export PROXY_ADDRESS=http://", { "Ref" : "BastionInstanceIP" }, ":3128/\n",
+            "export http_proxy=$PROXY_ADDRESS\n",
+            "export https_proxy=$PROXY_ADDRESS\n",
+            "export ftp_proxy=$PROXY_ADDRESS\n",
+            "cat << EOF >> /etc/bash.bashrc\n",
+            "export http_proxy=$PROXY_ADDRESS\n",
+            "export https_proxy=$PROXY_ADDRESS\n",
+            "export ftp_proxy=$PROXY_ADDRESS\n",
+            "EOF\n",
+            "cat << EOF >> /etc/apt/apt.conf.d/95proxy\n",
+            "Acquire::http::proxy \"$PROXY_ADDRESS\";\n",
+            "Acquire::ftp::proxy \"$PROXY_ADDRESS\";\n",
+            "Acquire::https::proxy \"$PROXY_ADDRESS\";\n",
+            "EOF\n",
+            "signalid=$RANDOM\n",
+            "function error_exit\n",
+            "{\n",
+            "  date +%s\n",
+            "  cfn-signal -e 1 -r \"$1\" '", { "Ref" : "WaitHandle" }, "'\n",
+            "  exit 1\n",
+            "}\n",
+
+            "function signal_success\n",
+            "{\n",
+            "  date +%s\n",
+            "  cfn-signal -e 0 -d \"$1\" -i \"$((signalid++))\" '", { "Ref" : "WaitHandle" }, "'\n",
+            "}\n",
+
+            "export DEBIAN_FRONTEND=noninteractive\n",
+            "apt-get --yes --quiet install python-setuptools || error_exit 'Failed to install python-setuptools'\n",
+            "easy_install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-1.0-6.tar.gz || error_exit 'Failed to install CFN scripts'\n",
+            "signal_success 'DBServer initialization - CFN'\n",
+            "cat << EOF >> /home/ubuntu/.s3cfg\n",
+            "[default]\n",
+            "access_key = ", { "Ref" : "AWSAccessKey" }, "\n",
+            "secret_key = ", { "Fn::GetAtt" : [ "AWSAccessKey", "SecretAccessKey" ] }, "\n",
+            "use_https = True\n",
+            "EOF\n",
+            "echo \"deb http://apt.opscode.com/ `lsb_release -cs`-0.10 main\" | tee /etc/apt/sources.list.d/opscode.list\n",
+            "gpg --keyserver keys.gnupg.net --recv-keys 83EF826A || gpg --keyserver pgp.mit.edu --recv-keys 83EF826A || error_exit 'Failed to obtain opscode PGP key'\n",
+            "gpg --export packages@opscode.com > /etc/apt/trusted.gpg.d/opscode-keyring.gpg\n",
+            "apt-get --yes --quiet update || error_exit 'Failed to update APT listing'\n",
+            "echo \"chef chef/chef_server_url string none\" | debconf-set-selections\n",
+            "apt-get --quiet --yes install opscode-keyring chef || error_exit 'Failed to install chef and opscode-keyring'\n",
+            "signal_success 'DBServer initialization - Chef installation'\n",
+            "apt-get --yes --quiet upgrade\n",
+            "apt-get --yes --quiet install git-core ssl-cert s3cmd mdadm xfsprogs lvm2 || error_exit 'Failed to install git'\n",
+            "cat << EOF > /etc/chef/solo.rb\n",
+            "log_level :info\n",
+            "log_location STDOUT\n",
+            "file_cache_path \"$CHEF_RDIR\"\n",
+            "cookbook_path \"$CHEF_RDIR/cookbooks\"\n",
+            "data_bag_path \"$CHEF_RDIR/data_bags\"\n",
+            "http_proxy \"$PROXY_ADDRESS\"\n",
+            "https_proxy \"$PROXY_ADDRESS\"\n",
+            "json_attribs \"/etc/chef/node.json\"\n",
+            "EOF\n",
+            "mkdir /root/.chef/\n",
+            "cat << EOF >> /root/.chef/knife.rb\n",
+            "http_proxy \"$PROXY_ADDRESS\"\n",
+            "https_proxy \"$PROXY_ADDRESS\"\n",
+            "log_level :info\n",
+            "log_location STDOUT\n",
+            "cache_type \"BasicFile\"\n",
+            "EOF\n",
+            "cat << EOF > /etc/chef/node.json\n",
+            "{\n\t\"percona\": {\n",
+            "\t\t\"server\": {\n",
+            "\t\t\t\"datadir\": \"/var/lib/mysql/datafiles\",\n",
+            "\t\t\t\"root_password\": \"change-the-root-password\",\n",
+            "\t\t\t\"debian_password\": \"change-the-system-maintaner-password\",\n",
+            "\t\t\t\"old_passwords\": \"off\",\n",
+            "\t\t\t\"bind_address\": \"\"\n",
+            "\t\t}\n",
+            "\t},\n",
+            "\t\"users\": [\"elewis\", \"zorlem\"],\n",
+            "\t\"run_list\":[\"recipe[percona::client]\",\"recipe[percona::server]\",\"recipe[user::data_bag]\"]\n",
+"}\n",
+            "EOF\n",
+            "chmod 600 /etc/chef/node.json\n",
+            "git clone -b sulfur-project ", {"Ref": "ChefRepo"}, " $CHEF_RDIR >> /tmp/bootscript.log || error_exit 'Failed to install chef skeleton'\n",
+            "(cd $CHEF_RDIR && git checkout -b master origin/sulfur-project)\n", 
+            "mkdir -p $CHEF_RDIR/data_bags/users\n",
+            "cat << EOF >> $CHEF_RDIR/data_bags/users/zorlem.json\n",
+            "{\n\"id\": \"zorlem\",\n",
+            "\"comment\": \"Hristo Erinin\",\n",
+	    "\"ssh_keygen\": \"no\",\n",
+            "\"ssh_keys\": [\n",
+            "\"ssh-rsa AAAAB3NzaC........ zorlem-greend\",\n",
+            "\"ssh-dss AAAAB3NzaC........ zorlem-angst\"\n",
+            "]\n}\n",
+            "EOF\n",
+            "cat << EOF >> $CHEF_RDIR/data_bags/users/sulfur-users.json\n",
+            "{\n\"id\": \"genadmin\",\n",
+            "\"comment\": \"Generic account for the website\",\n",
+	    "\"ssh_keygen\": \"no\",\n",
+            "\"ssh_keys\": [\n",
+            "\"ssh-rsa AAAAB3NzaC........ zorlem-greend\",\n",
+            "\"ssh-dss AAAAB3NzaC........ zorlem-angst\"\n",
+            "]\n}\n",
+            "EOF\n",
+            "cat << EOF >> $CHEF_RDIR/data_bags/users/elewis.json\n",
+            "{\n\"id\": \"elewis\",\n",
+            "\"comment\": \"Edward Lewis\",\n",
+	    "\"ssh_keygen\": \"no\",\n",
+            "\"ssh_keys\": [\n",
+            "\"ssh-rsa AAAAB3NzaC........ zorlem-greend\",\n",
+            "\"ssh-dss AAAAB3NzaC........ zorlem-angst\"\n",
+            "]\n}\n",
+            "EOF\n",
+            "update-rc.d chef-client disable\n",
+            "service chef-client stop\n",
+            "chef-solo >> /tmp/bootscript.log || error_exit 'Failed to configure the server with Chef'\n",
+            "signal_success 'DBServer initialization - Chef configuration complete'\n",
+            "## Waiting for EBS mounts to become available\n",
+            "for disk in sdi1 sdi2 sdi3 sdi4; do\n",
+            "   while [ ! -e /dev/${disk} ]; do echo Waiting for disk ${disk} to attach; sleep 10; done\n",
+            "done\n",
+            "mdadm --verbose --create /dev/md0 --level=10 --chunk=256 --raid-devices=4 /dev/sdi1 /dev/sdi2 /dev/sdi3 /dev/sdi4 >> /tmp/mdadm.log 2>&1\n",
+            "echo '`mdadm --detail --scan`' | tee -a /etc/mdadm.conf\n",
+            "## Set read-ahead on each device\n",
+            "for dev in md0 sdi1 sdi2 sdi3 sdi4; do\n",
+            "   blockdev --setra 128 /dev/${dev}\n",
+            "done\n",
+            "## Create physical and logical volumes\n",
+            "dd if=/dev/zero of=/dev/md0 bs=512 count=1\n",
+            "pvcreate /dev/md0\n",
+            "vgcreate datavg /dev/md0\n",
+            "lvcreate -l 97%vg -n mysqldata datavg\n",
+            "## Create filesystems and mount point info\n",
+            "mkfs.xfs -f /dev/datavg/mysqldata >> /tmp/mkxfs.log 2>&1\n",
+            "mount /dev/datavg/mysqldata /mnt\n",
+            "/etc/init.d/mysql stop\n",
+            "mv /var/lib/mysql/* /mnt/\n",
+            "umount /mnt\n",
+            "echo '/dev/datavg/mysqldata /var/lib/mysql xfs defaults,auto,noatime,noexec,nobootwait 0 0' | tee -a /etc/fstab\n",
+            "mount /dev/datavg/mysqldata >> /tmp/mount.log 2>&1\n",
+            "/etc/init.d/mysql start\n",
+            "echo Success\n"
+        ]]}},
+
+        "KeyName" : { "Ref" : "KeyName" },
+        "Tags" : [ 
+          {"Key" : "Application", "Value" : { "Ref" : "StackName"} },
+          {"Key" : "Environment", "Value" : { "Ref" : "Environment"} },
+          {"Key" : "ServerRole", "Value" : "Database" },
+          {"Key" : "Network", "Value" : "Private" }
+        ]
+      }
+    },
+
+    "DataVol1" : {
+      "Type" : "AWS::EC2::Volume",
+      "Properties" : {
+        "Size" : { "Ref" : "DataVolumeSize" },
+        "AvailabilityZone" : { "Fn::GetAtt" : [ "DBServerInstance", "AvailabilityZone" ]}
+      }
+    }, 
+
+    "DataVol2" : {
+      "Type" : "AWS::EC2::Volume",
+      "Properties" : {
+        "Size" : { "Ref" : "DataVolumeSize" },
+        "AvailabilityZone" : { "Fn::GetAtt" : [ "DBServerInstance", "AvailabilityZone" ]}
+      }
+    }, 
+
+    "DataVol3" : {
+      "Type" : "AWS::EC2::Volume",
+      "Properties" : {
+        "Size" : { "Ref" : "DataVolumeSize" },
+        "AvailabilityZone" : { "Fn::GetAtt" : [ "DBServerInstance", "AvailabilityZone" ]}
+      }
+    }, 
+
+    "DataVol4" : {
+      "Type" : "AWS::EC2::Volume",
+      "Properties" : {
+        "Size" : { "Ref" : "DataVolumeSize" },
+        "AvailabilityZone" : { "Fn::GetAtt" : [ "DBServerInstance", "AvailabilityZone" ]}
+      }
+    }, 
+
+    "DataMountPoint1" : {
+      "Type" : "AWS::EC2::VolumeAttachment",
+      "Properties" : {
+        "InstanceId" : { "Ref" : "DBServerInstance" },
+        "VolumeId"  : { "Ref" : "DataVol1" },
+        "Device" : "/dev/sdi1"
+      }
+    },
+
+    "DataMountPoint2" : {
+      "Type" : "AWS::EC2::VolumeAttachment",
+      "Properties" : {
+        "InstanceId" : { "Ref" : "DBServerInstance" },
+        "VolumeId"  : { "Ref" : "DataVol2" },
+        "Device" : "/dev/sdi2"
+      }
+    },
+
+    "DataMountPoint3" : {
+      "Type" : "AWS::EC2::VolumeAttachment",
+      "Properties" : {
+        "InstanceId" : { "Ref" : "DBServerInstance" },
+        "VolumeId"  : { "Ref" : "DataVol3" },
+        "Device" : "/dev/sdi3"
+      }
+    },
+
+    "DataMountPoint4" : {
+      "Type" : "AWS::EC2::VolumeAttachment",
+      "Properties" : {
+        "InstanceId" : { "Ref" : "DBServerInstance" },
+        "VolumeId"  : { "Ref" : "DataVol4" },
+        "Device" : "/dev/sdi4"
+      }
+    },
+
+    "WaitHandle" : {
+      "Type" : "AWS::CloudFormation::WaitConditionHandle"
+    },
+
+    "ServerWaitCondition" : {
+      "Type" : "AWS::CloudFormation::WaitCondition",
+      "DependsOn" : "DBServerInstance",
+      "Properties" : {
+        "Handle" : {"Ref" : "WaitHandle"},
+        "Timeout" : "540",
+        "Count" : "3"
+      }
+    }
+  },
+
+  "Outputs" : {
+
+    "DBWaitConditionData" : {
+      "Value" : { "Fn::GetAtt" : [ "ServerWaitCondition", "Data" ]},
+      "Description" : "The data passed back as part of signalling the WaitCondition"
+    }, 
+
+    "SecurityGroup": {
+      "Value": {"Ref": "SecurityGroup" },
+      "Description": "The SG of the DB servers."
+    },
+
+    "ServerIP" : {
+      "Value" : { "Fn::GetAtt" : ["DBServerInstance", "PrivateIp"] },
+      "Description" : "The IP address of the DB server."
+    }
+  }
+}
+

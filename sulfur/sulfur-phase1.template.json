@@ -1,0 +1,1414 @@
+{
+  "AWSTemplateFormatVersion" : "2010-09-09",
+
+  "Description" : "This template creates a VPC with private and public subnets. It also creates two EC2 instances - one in the private subnet designated as a server and another, in the public subnet, designated as a Proxy/NAT box and SSH bastion. The public EC2 instance is assigned an Elastic IP address and a security group.",
+
+  "Parameters" : {
+
+    "BastionInstanceType" : {
+      "Description" : "Bastion Server EC2 instance type",
+      "Type" : "String",
+      "Default" : "m1.small",
+      "AllowedValues" : [ "t1.micro","m1.small","m1.medium","m1.large","m1.xlarge","m2.xlarge","m2.2xlarge","m2.4xlarge","c1.medium","c1.xlarge","cc1.4xlarge","cc2.8xlarge","cg1.4xlarge"],
+      "ConstraintDescription" : "must be a valid EC2 instance type."
+    },
+
+    "WebDBServerInstanceType" : {
+      "Description" : "Web and DB Server EC2 instance type",
+      "Type" : "String",
+      "Default" : "m1.small",
+      "AllowedValues" : [ "t1.micro","m1.small","m1.medium","m1.large","m1.xlarge","m2.xlarge","m2.2xlarge","m2.4xlarge","c1.medium","c1.xlarge","cc1.4xlarge","cc2.8xlarge","cg1.4xlarge"],
+      "ConstraintDescription" : "must be a valid EC2 instance type."
+    },
+
+    "DataVolumeSize" : {
+      "Description" : "Web and DB Server data size (in GB). Due to RAID1+0 the actual available space will be 1/2 of the specified here.",
+      "Type" : "Number",
+      "Default" : "1",
+      "MinValue" : "1",
+      "MaxValue" : "1024",
+      "ConstraintDescription" : "must be between 1GB and 1024GB."
+    },
+
+    "KeyName" : {
+      "Description" : "KeyPair for SSH access to the instances. It must exist.",    "Type" : "String"
+    },
+
+    "Environment" : {
+      "Description" : "The name of the environment for this stack",
+      "Type" : "String",
+      "Default" : "production",
+      "AllowedValues" : [ "production","staging","development"],
+      "ConstraintDescription" : "must be one of production, staging or development"
+    },
+
+    "Domain" : {
+      "Description" : "The domain name of this stack",
+      "Type" : "String",
+      "Default" : "sulfur.erinin.net"
+    },
+
+    "ChefRepo": {
+      "Description": "Git repository that holds the chef recipes. At the moment this must be a public repository, a method for authentication is not provisioned yet.",
+      "Type": "String",
+      "Default": "https://github.com/zorlem/chef-cookbooks-repo.git",
+      "MinLength": "10",
+      "AllowedPattern": "^(http|https|git)://.*"
+    },
+
+    "S3Bucket" : {
+      "Description" : "An S3 Bucket containing private files",
+      "Type" : "String",
+      "Default" : "sulfur-private"
+    }
+  },
+
+  "Mappings" : {
+
+    "Region2S3Bucket": {
+      "us-east-1"      : { "s3bucket" : "https://s3.amazonaws.com/cf-templates-50la4ncl8fi9-us-east-1/" },
+      "eu-west-1"      : { "s3bucket" : "https://s3.amazonaws.com/cf-templates-50la4ncl8fi9-eu/" }
+    },
+    "RegionArch2AMI" : {
+      "us-east-1"      : { "32" : "ami-c5b202ac", "64" : "ami-c7b202ae" },
+      "us-west-1"      : { "32" : "ami-b988acfc", "64" : "ami-bb88acfe" },
+      "us-west-2"      : { "32" : "ami-184fc128", "64" : "ami-1a4fc12a" },
+      "eu-west-1"      : { "32" : "ami-534a4b27", "64" : "ami-5d4a4b29" },
+      "sa-east-1"      : { "32" : "ami-68c91075", "64" : "ami-6ac91077" },
+      "ap-southeast-1" : { "32" : "ami-923575c0", "64" : "ami-903575c2" },
+      "ap-northeast-1" : { "32" : "ami-8676ca87", "64" : "ami-8876ca89" }
+    },
+    "InstanceType2Arch" : {
+      "t1.micro"    : { "Arch" : "32" },
+      "m1.small"    : { "Arch" : "32" },
+      "m1.medium"   : { "Arch" : "64" },
+      "m1.large"    : { "Arch" : "64" },
+      "m1.xlarge"   : { "Arch" : "64" },
+      "m2.xlarge"   : { "Arch" : "64" },
+      "m2.2xlarge"  : { "Arch" : "64" },
+      "m2.4xlarge"  : { "Arch" : "64" },
+      "c1.medium"   : { "Arch" : "64" },
+      "c1.xlarge"   : { "Arch" : "64" }
+    },
+    "Env2VPNNet": {
+      "production": { "vpnnet": "10.82.4.0/23", "vpnnetaddress": "10.82.4.0" },
+      "development": { "vpnnet": "10.82.8.0/23", "vpnnetaddress": "10.82.8.0" },
+      "staging": { "vpnnet": "10.82.16.0/23", "vpnnetaddress": "10.82.16.0" }
+    },
+    "Env2Net": {
+      "production": {"vpcnet": "10.0.16.0/20", "pubnet": "10.0.16.0/24", "privatenet": "10.0.17.0/24", "weblbnet": "10.0.20.0/24", "serversnet": "10.0.16.0 255.255.252.0" },
+      "development": {"vpcnet": "10.0.48.0/20", "pubnet": "10.0.48.0/24", "privatenet": "10.0.49.0/24",  "weblbnet": "10.0.52.0/24", "serversnet": "10.0.48.0 255.255.252.0" },
+      "staging": {"vpcnet": "10.0.32.0/20", "pubnet": "10.0.32.0/24", "privatenet": "10.0.33.0/24", "weblbnet": "10.0.36.0/24", "serversnet": "10.0.32.0 255.255.252.0" }
+    },
+    "Env2Domain" : {
+      "production" : { "domain" : "" },
+      "development" : { "domain" : "dev." },
+      "staging" : { "domain" : "pre." }
+    }
+  },
+
+  "Resources" : {
+
+    "VPC" : {
+      "Type" : "AWS::EC2::VPC",
+      "Properties" : {
+        "CidrBlock" : {"Fn::FindInMap": [ "Env2Net", { "Ref": "Environment" }, "vpcnet" ] },
+        "Tags" : [
+          {"Key" : "Application", "Value" : { "Ref" : "AWS::StackName"} },
+          {"Key" : "Environment", "Value" : { "Ref" : "Environment"} }
+        ]
+      }
+    },
+    "DHCPOptions": {
+      "Type" : "AWS::EC2::DHCPOptions",
+      "Properties" : {
+        "DomainName" : { "Fn::Join" :
+                      ["", [
+                          { "Fn::FindInMap": [ "Env2Domain", { "Ref": "Environment" }, "domain" ] },
+                          { "Ref" : "Domain" }
+                          ] ]
+        },
+        "DomainNameServers" : ["AmazonProvidedDNS"],
+        "Tags" : [
+          {"Key": "Environment", "Value": {"Ref": "Environment"}},
+          {"Key": "Application", "Value": {"Ref": "AWS::StackName"}}
+        ]
+      }
+    },
+    "AttachDHCPOptions": {
+      "Type": "AWS::EC2::VPCDHCPOptionsAssociation",
+      "Properties": {
+        "VpcId": {"Ref": "VPC"},
+        "DhcpOptionsId": {"Ref": "DHCPOptions"}
+      }
+    },
+    "PublicSubnet" : {
+      "Type" : "AWS::EC2::Subnet",
+      "Properties" : {
+        "VpcId" : { "Ref" : "VPC" },
+        "CidrBlock" : {"Fn::FindInMap": [ "Env2Net", { "Ref": "Environment" }, "pubnet" ] },
+        "Tags" : [
+          {"Key" : "Application", "Value" : { "Ref" : "AWS::StackName"} },
+          {"Key" : "Environment", "Value" : { "Ref" : "Environment"} },
+          {"Key" : "Network", "Value" : "Public" }
+        ]
+      }
+    },
+
+    "Gateway" : {
+      "Type" : "AWS::EC2::InternetGateway",
+      "Properties" : {
+        "Tags" : [
+          {"Key" : "Application", "Value" : { "Ref" : "AWS::StackName"} },
+          {"Key" : "Environment", "Value" : { "Ref" : "Environment"} },
+          {"Key" : "Network", "Value" : "Public" }
+        ]
+      }
+    },
+
+    "AttachGateway" : {
+       "Type" : "AWS::EC2::VPCGatewayAttachment",
+       "Properties" : {
+         "VpcId" : { "Ref" : "VPC" },
+         "InternetGatewayId" : { "Ref" : "Gateway" }
+       }
+    },
+
+    "PublicRouteTable" : {
+      "Type" : "AWS::EC2::RouteTable",
+      "Properties" : {
+        "VpcId" : {"Ref" : "VPC"},
+        "Tags" : [
+          {"Key" : "Application", "Value" : { "Ref" : "AWS::StackName"} },
+          {"Key" : "Environment", "Value" : { "Ref" : "Environment"} },
+          {"Key" : "Network", "Value" : "Public" }
+        ]
+      }
+    },
+
+    "PublicRoute" : {
+      "Type" : "AWS::EC2::Route",
+      "Properties" : {
+        "RouteTableId" : { "Ref" : "PublicRouteTable" },
+        "DestinationCidrBlock" : "0.0.0.0/0",
+        "GatewayId" : { "Ref" : "Gateway" }
+      }
+    },
+
+    "PublicSubnetRouteTableAssociation" : {
+      "Type" : "AWS::EC2::SubnetRouteTableAssociation",
+      "Properties" : {
+        "SubnetId" : { "Ref" : "PublicSubnet" },
+        "RouteTableId" : { "Ref" : "PublicRouteTable" }
+      }
+    },
+
+    "PublicNetworkAcl" : {
+      "Type" : "AWS::EC2::NetworkAcl",
+      "Properties" : {
+        "VpcId" : {"Ref" : "VPC"},
+        "Tags" : [
+          {"Key" : "Application", "Value" : { "Ref" : "AWS::StackName"} },
+          {"Key" : "Environment", "Value" : { "Ref" : "Environment"} },
+          {"Key" : "Network", "Value" : "Public" }
+        ]
+      }
+    },
+
+    "InboundSSHNetworkAclEntry" : {
+      "Type" : "AWS::EC2::NetworkAclEntry",
+      "Properties" : {
+        "NetworkAclId" : {"Ref" : "PublicNetworkAcl"},
+        "RuleNumber" : "100",
+        "Protocol" : "6",
+        "RuleAction" : "allow",
+        "Egress" : "false",
+        "CidrBlock" : "0.0.0.0/0",
+        "PortRange" : {"From" : "22", "To" : "22"}
+      }
+    },
+
+    "InboundSSLNetworkAclEntry" : {
+      "Type" : "AWS::EC2::NetworkAclEntry",
+      "Properties" : {
+        "NetworkAclId" : {"Ref" : "PublicNetworkAcl"},
+        "RuleNumber" : "101",
+        "Protocol" : "6",
+        "RuleAction" : "allow",
+        "Egress" : "false",
+        "CidrBlock" : "0.0.0.0/0",
+        "PortRange" : {"From" : "443", "To" : "443"}
+      }
+    },
+
+    "InboundProxyNetworkAclEntry" : {
+      "Type" : "AWS::EC2::NetworkAclEntry",
+      "Properties" : {
+        "NetworkAclId" : {"Ref" : "PublicNetworkAcl"},
+        "RuleNumber" : "102",
+        "Protocol" : "6",
+        "RuleAction" : "allow",
+        "Egress" : "false",
+        "CidrBlock" : {"Fn::FindInMap": [ "Env2Net", { "Ref": "Environment" }, "privatenet" ] },
+        "PortRange" : {"From" : "3128", "To" : "3128"}
+      }
+    },
+
+    "InboundVPNNetworkAclEntry" : {
+      "Type" : "AWS::EC2::NetworkAclEntry",
+      "Properties" : {
+        "NetworkAclId" : {"Ref" : "PublicNetworkAcl"},
+        "RuleNumber" : "103",
+        "Protocol" : "17",
+        "RuleAction" : "allow",
+        "Egress" : "false",
+        "CidrBlock" : "0.0.0.0/0",
+        "PortRange" : {"From" : "1194", "To" : "1194"}
+      }
+    },
+
+    "InboundResponseNetworkAclEntry" : {
+      "Type" : "AWS::EC2::NetworkAclEntry",
+      "Properties" : {
+        "NetworkAclId" : {"Ref" : "PublicNetworkAcl"},
+        "RuleNumber" : "120",
+        "Protocol" : "6",
+        "RuleAction" : "allow",
+        "Egress" : "false",
+        "CidrBlock" : "0.0.0.0/0",
+        "PortRange" : {"From" : "32768", "To" : "61000"}
+      }
+    },
+
+    "OutBoundResponsePortsNetworkAclEntry" : {
+      "Type" : "AWS::EC2::NetworkAclEntry",
+      "Properties" : {
+        "NetworkAclId" : {"Ref" : "PublicNetworkAcl"},
+        "RuleNumber" : "100",
+        "Protocol" : "6",
+        "RuleAction" : "allow",
+        "Egress" : "true",
+        "CidrBlock" : "0.0.0.0/0",
+        "PortRange" : {"From" : "1024", "To" : "65535"}
+      }
+    },
+
+    "OutboundHTTPNetworkAclEntry" : {
+      "Type" : "AWS::EC2::NetworkAclEntry",
+      "Properties" : {
+        "NetworkAclId" : {"Ref" : "PublicNetworkAcl"},
+        "RuleNumber" : "102",
+        "Protocol" : "6",
+        "RuleAction" : "allow",
+        "Egress" : "true",
+        "CidrBlock" : "0.0.0.0/0",
+        "PortRange" : {"From" : "80", "To" : "80"}
+      }
+    },
+
+    "OutboundHTTPSNetworkAclEntry" : {
+      "Type" : "AWS::EC2::NetworkAclEntry",
+      "Properties" : {
+        "NetworkAclId" : {"Ref" : "PublicNetworkAcl"},
+        "RuleNumber" : "103",
+        "Protocol" : "6",
+        "RuleAction" : "allow",
+        "Egress" : "true",
+        "CidrBlock" : "0.0.0.0/0",
+        "PortRange" : {"From" : "443", "To" : "443"}
+      }
+    },
+
+    "OutboundSSHNetworkAclEntry" : {
+      "Type" : "AWS::EC2::NetworkAclEntry",
+      "Properties" : {
+        "NetworkAclId" : {"Ref" : "PublicNetworkAcl"},
+        "RuleNumber" : "104",
+        "Protocol" : "6",
+        "RuleAction" : "allow",
+        "Egress" : "true",
+        "CidrBlock" : {"Fn::FindInMap": [ "Env2Net", { "Ref": "Environment" }, "privatenet" ] },
+        "PortRange" : {"From" : "22", "To" : "22"}
+      }
+    },
+
+    "OutboundUDPVPNNetworkAclEntry" : {
+      "Type" : "AWS::EC2::NetworkAclEntry",
+      "Properties" : {
+        "NetworkAclId" : {"Ref" : "PublicNetworkAcl"},
+        "RuleNumber" : "105",
+        "Protocol" : "17",
+        "RuleAction" : "allow",
+        "Egress" : "true",
+        "CidrBlock" : "0.0.0.0/0",
+        "PortRange" : {"From" : "1025", "To" : "61000"}
+      }
+    },
+
+    "PublicSubnetNetworkAclAssociation" : {
+      "Type" : "AWS::EC2::SubnetNetworkAclAssociation",
+      "Properties" : {
+        "SubnetId" : { "Ref" : "PublicSubnet" },
+        "NetworkAclId" : { "Ref" : "PublicNetworkAcl" }
+      }
+    },
+
+    "PrivateSubnet" : {
+      "Type" : "AWS::EC2::Subnet",
+      "Properties" : {
+        "VpcId" : { "Ref" : "VPC" },
+        "CidrBlock" : {"Fn::FindInMap": [ "Env2Net", { "Ref": "Environment" }, "privatenet" ] },
+        "Tags" : [
+          {"Key" : "Application", "Value" : { "Ref" : "AWS::StackName"} },
+          {"Key" : "Environment", "Value" : { "Ref" : "Environment"} },
+          {"Key" : "Network", "Value" : "Private" }
+        ]
+      }
+    },
+
+    "PrivateRouteTable" : {
+      "Type" : "AWS::EC2::RouteTable",
+      "Properties" : {
+        "VpcId" : {"Ref" : "VPC"},
+        "Tags" : [
+          {"Key" : "Application", "Value" : { "Ref" : "AWS::StackName"} },
+          {"Key" : "Environment", "Value" : { "Ref" : "Environment"} },
+          {"Key" : "Network", "Value" : "Private" }
+        ]
+      }
+    },
+
+    "Private2VPNRoute" : {
+      "Type" : "AWS::EC2::Route",
+      "Properties" : {
+        "RouteTableId" : { "Ref" : "PrivateRouteTable" },
+        "DestinationCidrBlock" : {"Fn::FindInMap": [ "Env2VPNNet", { "Ref": "Environment" }, "vpnnet" ] },
+        "InstanceId" : { "Ref" : "BastionInstance" }
+      }
+    },
+
+    "PrivateSubnetRouteTableAssociation" : {
+      "Type" : "AWS::EC2::SubnetRouteTableAssociation",
+      "Properties" : {
+        "SubnetId" : { "Ref" : "PrivateSubnet" },
+        "RouteTableId" : { "Ref" : "PrivateRouteTable" }
+      }
+    },
+
+    "PrivateNetworkAcl" : {
+      "Type" : "AWS::EC2::NetworkAcl",
+      "Properties" : {
+        "VpcId" : {"Ref" : "VPC"},
+        "Tags" : [
+          {"Key" : "Application", "Value" : { "Ref" : "AWS::StackName"} },
+          {"Key" : "Network", "Value" : "Private" }
+        ]
+      }
+    },
+
+    "InboundPrivateNetworkAclEntry" : {
+      "Type" : "AWS::EC2::NetworkAclEntry",
+      "Properties" : {
+        "NetworkAclId" : {"Ref" : "PrivateNetworkAcl"},
+        "RuleNumber" : "100",
+        "Protocol" : "6",
+        "RuleAction" : "allow",
+        "Egress" : "false",
+        "CidrBlock" : "0.0.0.0/0",
+        "PortRange" : {"From" : "0", "To" : "65535"}
+      }
+    },
+
+    "OutBoundPrivateNetworkAclEntry" : {
+      "Type" : "AWS::EC2::NetworkAclEntry",
+      "Properties" : {
+        "NetworkAclId" : {"Ref" : "PrivateNetworkAcl"},
+        "RuleNumber" : "100",
+        "Protocol" : "6",
+        "RuleAction" : "allow",
+        "Egress" : "true",
+        "CidrBlock" : "0.0.0.0/0",
+        "PortRange" : {"From" : "0", "To" : "65535"}
+      }
+    },
+
+    "PrivateSubnetNetworkAclAssociation" : {
+      "Type" : "AWS::EC2::SubnetNetworkAclAssociation",
+      "Properties" : {
+        "SubnetId" : { "Ref" : "PrivateSubnet" },
+        "NetworkAclId" : { "Ref" : "PrivateNetworkAcl" }
+      }
+    },
+
+    "LBSubnet" : {
+      "Type" : "AWS::EC2::Subnet",
+      "Properties" : {
+        "VpcId" : { "Ref" : "VPC" },
+        "CidrBlock" : {"Fn::FindInMap": [ "Env2Net", { "Ref": "Environment" }, "weblbnet" ] },
+        "Tags" : [
+          {"Key" : "Application", "Value" : { "Ref" : "AWS::StackName"} },
+          {"Key" : "Environment", "Value" : { "Ref" : "Environment"} },
+          {"Key" : "Network", "Value" : "LB" }
+        ]
+      }
+    },
+
+    "LBRoute" : {
+      "Type" : "AWS::EC2::Route",
+      "Properties" : {
+        "RouteTableId" : { "Ref" : "LBRouteTable" },
+        "DestinationCidrBlock" : "0.0.0.0/0",
+        "GatewayId" : { "Ref" : "Gateway" }
+      }
+    },
+
+    "LBRouteTable" : {
+      "Type" : "AWS::EC2::RouteTable",
+      "Properties" : {
+        "VpcId" : {"Ref" : "VPC"},
+        "Tags" : [
+          {"Key" : "Application", "Value" : { "Ref" : "AWS::StackName"} },
+          {"Key" : "Environment", "Value" : { "Ref" : "Environment"} },
+          {"Key" : "Network", "Value" : "LB" }
+        ]
+      }
+    },
+
+    "LBSubnetRouteTableAssociation" : {
+      "Type" : "AWS::EC2::SubnetRouteTableAssociation",
+      "Properties" : {
+        "SubnetId" : { "Ref" : "LBSubnet" },
+        "RouteTableId" : { "Ref" : "LBRouteTable" }
+      }
+    },
+
+    "LBNetworkAcl" : {
+      "Type" : "AWS::EC2::NetworkAcl",
+      "Properties" : {
+        "VpcId" : {"Ref" : "VPC"},
+        "Tags" : [
+          {"Key" : "Application", "Value" : { "Ref" : "AWS::StackName"} },
+          {"Key" : "Network", "Value" : "LB" }
+        ]
+      }
+    },
+
+    "InboundHTTPLBNetworkAclEntry" : {
+      "Type" : "AWS::EC2::NetworkAclEntry",
+      "Properties" : {
+        "NetworkAclId" : {"Ref" : "LBNetworkAcl"},
+        "RuleNumber" : "100",
+        "Protocol" : "6",
+        "RuleAction" : "allow",
+        "Egress" : "false",
+        "CidrBlock" : "0.0.0.0/0",
+        "PortRange" : {"From" : "80", "To" : "80"}
+      }
+    },
+
+    "InboundHTTPSLBNetworkAclEntry" : {
+      "Type" : "AWS::EC2::NetworkAclEntry",
+      "Properties" : {
+        "NetworkAclId" : {"Ref" : "LBNetworkAcl"},
+        "RuleNumber" : "101",
+        "Protocol" : "6",
+        "RuleAction" : "allow",
+        "Egress" : "false",
+        "CidrBlock" : "0.0.0.0/0",
+        "PortRange" : {"From" : "443", "To" : "443"}
+      }
+    },
+
+    "InboundLBNetworkAclEntry" : {
+      "Type" : "AWS::EC2::NetworkAclEntry",
+      "Properties" : {
+        "NetworkAclId" : {"Ref" : "LBNetworkAcl"},
+        "RuleNumber" : "120",
+        "Protocol" : "6",
+        "RuleAction" : "allow",
+        "Egress" : "false",
+        "CidrBlock" : "0.0.0.0/0",
+        "PortRange" : {"From" : "1024", "To" : "65535"}
+      }
+    },
+
+    "OutBoundHTTPLBNetworkAclEntry" : {
+      "Type" : "AWS::EC2::NetworkAclEntry",
+      "Properties" : {
+        "NetworkAclId" : {"Ref" : "LBNetworkAcl"},
+        "RuleNumber" : "100",
+        "Protocol" : "6",
+        "RuleAction" : "allow",
+        "Egress" : "true",
+        "CidrBlock" : "0.0.0.0/0",
+        "PortRange" : {"From" : "80", "To" : "80"}
+      }
+    },
+
+    "OutBoundHTTPSLBNetworkAclEntry" : {
+      "Type" : "AWS::EC2::NetworkAclEntry",
+      "Properties" : {
+        "NetworkAclId" : {"Ref" : "LBNetworkAcl"},
+        "RuleNumber" : "101",
+        "Protocol" : "6",
+        "RuleAction" : "allow",
+        "Egress" : "true",
+        "CidrBlock" : "0.0.0.0/0",
+        "PortRange" : {"From" : "443", "To" : "443"}
+      }
+    },
+    "OutBoundLBNetworkAclEntry" : {
+      "Type" : "AWS::EC2::NetworkAclEntry",
+      "Properties" : {
+        "NetworkAclId" : {"Ref" : "LBNetworkAcl"},
+        "RuleNumber" : "120",
+        "Protocol" : "6",
+        "RuleAction" : "allow",
+        "Egress" : "true",
+        "CidrBlock" : "0.0.0.0/0",
+        "PortRange" : {"From" : "1024", "To" : "65535"}
+      }
+    },
+
+    "LBSubnetNetworkAclAssociation" : {
+      "Type" : "AWS::EC2::SubnetNetworkAclAssociation",
+      "Properties" : {
+        "SubnetId" : { "Ref" : "LBSubnet" },
+        "NetworkAclId" : { "Ref" : "LBNetworkAcl" }
+      }
+    },
+
+    "IPAddress" : {
+      "Type" : "AWS::EC2::EIP",
+      "Properties" : {
+        "Domain" : "vpc",
+        "InstanceId" : { "Ref" : "BastionInstance" }
+      }
+    },
+
+    "S3PolicyIP" : {
+      "Type" : "AWS::S3::BucketPolicy",
+      "Properties" : {
+        "PolicyDocument" : {
+          "Id": "S3BastionIP",
+          "Statement": [ {
+            "Sid": "IPDeny",
+            "Effect": "Deny",
+            "Principal": { "AWS": "*" },
+            "Action": "s3:*",
+            "Resource" : { "Fn::Join" : [ "", [ "arn:aws:s3:::", { "Ref" : "S3Bucket" }, "/*" ] ] },
+            "Condition": {
+              "NotIpAddress": {
+                "aws:SourceIp": { "Fn::Join" : ["",
+                  [
+                    { "Fn::GetAtt" : ["BastionInstance", "PublicIp"] }, "/32"
+                  ]
+                ] }
+              }
+            }
+          } ]
+        },
+        "Bucket" : {"Ref" : "S3Bucket" }
+      }
+    },
+
+    "GetS3ContentPolicy" : {
+      "Type" : "AWS::IAM::Policy",
+      "Properties" : {
+        "PolicyName" : "S3PrivateContent",
+        "PolicyDocument" : {
+          "Statement" : [ {
+            "Effect" : "Allow",
+            "Action" : [
+              "s3:ListBucket"
+            ],
+            "Resource" : [ {
+              "Fn::Join" : ["",
+                [
+                  "arn:aws:s3:::", { "Ref" : "S3Bucket" }
+                ]
+              ]
+            } ]
+          },
+          {
+            "Effect" : "Allow",
+            "Action" : [
+              "s3:GetObject",
+              "s3:GetObjectVersion"
+            ],
+            "Resource" : [ {
+              "Fn::Join" : ["",
+                [
+                  "arn:aws:s3:::", { "Ref" : "S3Bucket" }, "/*"
+                ]
+              ]
+            } ]
+          } ]
+        },
+        "Groups" : [
+          { "Ref" : "ManagementInstancesGroup" },
+          { "Ref" : "WebInstancesGroup" }
+        ]
+      }
+    },
+
+    "GetConfigPolicy" : {
+      "Type" : "AWS::IAM::Policy",
+      "Properties" : {
+        "PolicyName" : "CFNConfig",
+        "PolicyDocument" : {
+          "Statement" : [ {
+            "Effect" : "Allow",
+            "Action" : "cloudformation:DescribeStackResource",
+            "Resource" : "*"
+          } ]
+        },
+        "Groups" : [
+          { "Ref" : "ManagementInstancesGroup" },
+          { "Ref" : "WebInstancesGroup" }
+        ]
+      }
+    },
+
+    "BastionIAMUser" : {
+      "Type" : "AWS::IAM::User",
+      "Properties" : {
+        "Path" : "/servers/management/bastioninstance/"
+      }
+    },
+
+    "BastionAWSAccessKey" : {
+      "Type" : "AWS::IAM::AccessKey",
+      "Properties" : {
+        "UserName" : {"Ref": "BastionIAMUser"}
+      }
+    },
+
+    "ManagementInstancesGroup" : {
+      "Type" : "AWS::IAM::Group",
+      "Properties" : {
+        "Path" : "/servers/management/"
+      }
+    },
+
+    "Bastion2ManagementInstancesGroup" : {
+      "Type" : "AWS::IAM::UserToGroupAddition",
+      "Properties" : {
+        "GroupName" : { "Ref" : "ManagementInstancesGroup" },
+        "Users" : [ { "Ref" : "BastionIAMUser" } ]
+      }
+    },
+
+    "WebIAMUser" : {
+      "Type" : "AWS::IAM::User",
+      "Properties" : {
+        "Path" : "/servers/content/web/"
+      }
+    },
+
+    "WebDBAWSAccessKey" : {
+      "Type" : "AWS::IAM::AccessKey",
+      "Properties" : {
+        "UserName" : {"Ref": "WebIAMUser"}
+      }
+    },
+
+    "WebInstancesGroup" : {
+      "Type" : "AWS::IAM::Group",
+      "Properties" : {
+        "Path" : "/servers/content/web/"
+      }
+    },
+
+    "WebDB2WebInstancesGroup" : {
+      "Type" : "AWS::IAM::UserToGroupAddition",
+      "Properties" : {
+        "GroupName" : { "Ref" : "WebInstancesGroup" },
+        "Users" : [ { "Ref" : "WebIAMUser" } ]
+      }
+    },
+
+    "LBSecurityGroup" : {
+      "Type" : "AWS::EC2::SecurityGroup",
+      "Properties" : {
+        "GroupDescription" : "Enable access on ports 80 and 443 from the LB",
+        "VpcId" : { "Ref" : "VPC" },
+        "SecurityGroupIngress" : [
+          { "IpProtocol" : "tcp", "FromPort" : "80", "ToPort" : "80", "CidrIp" : "0.0.0.0/0" },
+          { "IpProtocol" : "tcp", "FromPort" : "443", "ToPort" : "443", "CidrIp" : "0.0.0.0/0" } ],
+        "SecurityGroupEgress" : [
+          { "IpProtocol" : "tcp", "FromPort" : "80", "ToPort" : "80", "CidrIp" : "0.0.0.0/0" },
+          { "IpProtocol" : "tcp", "FromPort" : "443", "ToPort" : "443", "CidrIp" : "0.0.0.0/0" } ]
+      }
+    },
+
+    "ElasticLoadBalancer" : {
+      "Type" : "AWS::ElasticLoadBalancing::LoadBalancer",
+      "Properties" : {
+        "Instances" : [ { "Ref" : "WebDBServerInstance" } ],
+        "Subnets" : [ { "Ref" : "LBSubnet" } ],
+        "SecurityGroups" : [ {"Ref" : "LBSecurityGroup" } ],
+        "Listeners" : [ {
+            "LoadBalancerPort" : "80",
+            "InstancePort" : "80",
+            "Protocol" : "HTTP"
+          },
+          {
+            "LoadBalancerPort" : "443",
+            "InstancePort" : "443",
+            "Protocol" : "TCP"
+          } ],
+        "HealthCheck" : {
+          "Target" : "HTTP:80/",
+          "HealthyThreshold" : "3",
+          "UnhealthyThreshold" : "5",
+          "Interval" : "30",
+          "Timeout" : "5"
+        }
+      }
+    },
+
+    "BastionSecurityGroup" : {
+      "Type" : "AWS::EC2::SecurityGroup",
+      "Properties" : {
+        "VpcId" : { "Ref" : "VPC" },
+        "GroupDescription" : "Enable secure access to the bastion server",
+        "SecurityGroupIngress" : [
+          { "IpProtocol" : "udp", "FromPort" : "1194", "ToPort" : "1194", "CidrIp" : "0.0.0.0/0" },
+          { "IpProtocol" : "tcp", "FromPort" : "22", "ToPort" : "22", "CidrIp" : "0.0.0.0/0" },
+          { "IpProtocol" : "tcp", "FromPort" : "443", "ToPort" : "443", "CidrIp" : "0.0.0.0/0" },
+          { "IpProtocol" : "tcp", "FromPort" : "3128", "ToPort" : "3128", "CidrIp" : {"Fn::FindInMap": [ "Env2Net", { "Ref": "Environment" }, "privatenet" ] } }
+         ]
+      }
+    },
+
+    "BastionInstance" : {
+      "Type" : "AWS::EC2::Instance",
+      "Properties" : {
+        "ImageId" : { "Fn::FindInMap": [ "RegionArch2AMI", { "Ref": "AWS::Region" }, { "Fn::FindInMap": [ "InstanceType2Arch", { "Ref": "BastionInstanceType" }, "Arch" ] } ] },
+        "SecurityGroupIds" : [{ "Ref" : "BastionSecurityGroup" }],
+        "SubnetId" : { "Ref" : "PublicSubnet" },
+        "SourceDestCheck" : "false",
+        "InstanceType" : { "Ref" : "BastionInstanceType" },
+        "UserData" : { "Fn::Base64" : { "Fn::Join" : ["", [
+            "#!/bin/bash\n",
+
+            "set -e -x\n",
+            "export CHEF_RDIR='/usr/local/share/chef-solo'\n",
+            "signalid=$RANDOM\n",
+            "function error_exit\n",
+            "{\n",
+            "  date +%s\n",
+            "  cfn-signal -e 1 -r \"$1\" '", { "Ref" : "BastionWaitHandle" }, "'\n",
+            "  exit 1\n",
+            "}\n",
+
+            "function signal_success\n",
+            "{\n",
+            "  date +%s\n",
+            "  cfn-signal -e 0 -d \"$1\" -i \"$((signalid++))\" '", { "Ref" : "BastionWaitHandle" }, "'\n",
+            "}\n",
+
+            "export DEBIAN_FRONTEND=noninteractive\n",
+            "apt-get --yes --quiet install python-setuptools || error_exit 'Failed to install python-setuptools'\n",
+            "easy_install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-1.0-6.tar.gz || error_exit 'Failed to install CFN scripts'\n",
+            "signal_success 'Bastion initialization - CFN'\n",
+            "cat << EOF >> /home/ubuntu/.s3cfg\n",
+            "[default]\n",
+            "access_key = ", { "Ref" : "BastionAWSAccessKey" }, "\n",
+            "secret_key = ", { "Fn::GetAtt" : [ "BastionAWSAccessKey", "SecretAccessKey" ] }, "\n",
+            "use_https = True\n",
+            "EOF\n",
+            "echo \"deb http://apt.opscode.com/ `lsb_release -cs`-0.10 main\" | tee /etc/apt/sources.list.d/opscode.list\n",
+            "gpg --keyserver keys.gnupg.net --recv-keys 83EF826A || gpg --keyserver pgp.mit.edu --recv-keys 83EF826A || error_exit 'Failed to obtain opscode PGP key'\n",
+            "gpg --export packages@opscode.com > /etc/apt/trusted.gpg.d/opscode-keyring.gpg\n",
+            "apt-get --yes --quiet update || error_exit 'Failed to update APT listing'\n",
+            "echo \"chef chef/chef_server_url string none\" | debconf-set-selections\n",
+            "apt-get --quiet --yes install opscode-keyring chef || error_exit 'Failed to install chef and opscode-keyring'\n",
+            "signal_success 'Bastion initialization - Chef installation'\n",
+            "apt-get --yes --quiet upgrade\n",
+            "apt-get --yes --quiet install git-core ssl-cert s3cmd rake || error_exit 'Failed to install git'\n",
+            "cat << EOF > /etc/chef/solo.rb\n",
+            "log_level :info\n",
+            "log_location STDOUT\n",
+            "file_cache_path \"$CHEF_RDIR\"\n",
+            "cookbook_path \"$CHEF_RDIR/cookbooks\"\n",
+            "data_bag_path \"$CHEF_RDIR/data_bags\"\n",
+            "json_attribs \"/etc/chef/node.json\"\n",
+            "EOF\n",
+            "cat << EOF > /etc/chef/node.json\n",
+            "{\n\t\"openvpn\": {\n",
+            "\t\t\"script_security\":\"2\",\n",
+            "\t\t\"subnet\":\"", {"Fn::FindInMap": [ "Env2VPNNet", { "Ref": "Environment" }, "vpnnetaddress" ] },"\",\n",
+            "\t\t\"netmask\":\"255.255.254.0\",\n",
+            "\t\t\"routes\": [ \"push 'route ", {"Fn::FindInMap": [ "Env2Net", { "Ref": "Environment" }, "serversnet" ]}, "'\" ],\n",
+            "\t\t\"tls-auth\":\"ta.key\",\n",
+            "\t\t\"gateway\":\"ovpn.",  { "Fn::FindInMap": [ "Env2Domain", { "Ref": "Environment" }, "domain" ] }, { "Ref" : "Domain" }, "\",\n",
+            "\t\t\"key\": {\n",
+            "\t\t\t\"ca_expire\":\"2920\",\n",
+            "\t\t\t\"expire\":\"1825\",\n",
+            "\t\t\t\"country\":\"ES\",\n",
+            "\t\t\t\"province\":\"Madrid\",\n",
+            "\t\t\t\"city\":\"Madrid\",\n",
+            "\t\t\t\"org\":\"FXAcction Ltd\",\n",
+            "\t\t\t\"email\":\"admin_AT_gmail.com\"\n",
+            "\t\t}\n",
+            "\t},\n",
+            "\t\"users\": [\"elewis\", \"zorlem\"],\n",
+            "\t\"run_list\": [\"recipe[squid]\",\"recipe[openvpn]\",\"recipe[user::data_bag]\"]\n}\n",
+            "EOF\n",
+            "chmod 600 /etc/chef/node.json\n",
+            "git clone -b sulfur-project ", {"Ref": "ChefRepo"}, " $CHEF_RDIR >> /tmp/bootscript.log || error_exit 'Failed to install chef skeleton'\n",
+            "(cd $CHEF_RDIR && git checkout -b master origin/sulfur-project)\n",
+            "update-rc.d chef-client disable\n",
+            "service chef-client stop\n",
+            "knife cookbook site install squid --cookbook-path $CHEF_RDIR/cookbooks >>/tmp/bootscript.log || error_exit 'Failed to install squid cookbook'\n",
+            "mkdir -p $CHEF_RDIR/data_bags/{squid_acls,squid_hosts,users}\n",
+            "echo '{\n  \"id\": \"privatenet\",\n  \"acl\": [\n    [ \"ports\", \"allow\" ]\n    ]\n}' > $CHEF_RDIR/data_bags/squid_acls/privatenet.json\n",
+            "echo '{\n  \"type\": \"port\",\n  \"id\": \"ports\",\n  \"net\": [ \"80\", \"443\", \"4000\", \"11371\" ]\n}' > $CHEF_RDIR/data_bags/squid_hosts/ports.json\n",
+            "echo '{\n  \"type\": \"src\",\n  \"id\": \"privatenet\",\n  \"net\": [ \"",{"Fn::FindInMap": [ "Env2Net", { "Ref": "Environment" }, "privatenet" ] } , "\" ]\n}' > $CHEF_RDIR/data_bags/squid_hosts/privatenet.json\n",
+            "cat << EOF >> $CHEF_RDIR/data_bags/users/zorlem.json\n",
+            "{\n\"id\": \"zorlem\",\n",
+            "\"comment\": \"Hristo Erinin\",\n",
+            "\"ssh_keygen\": \"no\",\n",
+            "\"ssh_keys\": [\n",
+            "\"ssh-rsa AAAAB3NzaC........ zorlem-greend\",\n",
+            "\"ssh-dss AAAAB3NzaC........ zorlem-angst\"\n",
+            "]\n}\n",
+            "EOF\n",
+            "cat << EOF >> $CHEF_RDIR/data_bags/users/sulfur-users.json\n",
+            "{\n\"id\": \"genadmin\",\n",
+            "\"comment\": \"Generic account for the website\",\n",
+            "\"ssh_keygen\": \"no\",\n",
+            "\"ssh_keys\": [\n",
+            "\"ssh-rsa AAAAB3NzaC........ zorlem-greend\",\n",
+            "\"ssh-dss AAAAB3NzaC........ zorlem-angst\"\n",
+            "]\n}\n",
+            "EOF\n",
+            "cat << EOF >> $CHEF_RDIR/data_bags/users/elewis.json\n",
+            "{\n\"id\": \"elewis\",\n",
+            "\"comment\": \"Edward Lewis\",\n",
+            "\"ssh_keygen\": \"no\",\n",
+            "\"ssh_keys\": [\n",
+            "\"ssh-rsa AAAAB3NzaC........ zorlem-greend\",\n",
+            "\"ssh-dss AAAAB3NzaC........ zorlem-angst\"\n",
+            "]\n}\n",
+            "EOF\n",
+            "chef-solo >> /tmp/bootscript.log || error_exit 'Failed to run chef-solo, output is available in /tmp/bootscript.log'\n",
+            "signal_success 'Bastion initialization - Chef configuration complete'\n",
+            "echo Success\n"
+        ]]}},
+
+        "KeyName" : { "Ref" : "KeyName" },
+        "Tags" : [
+          {"Key" : "Application", "Value" : { "Ref" : "AWS::StackName"} },
+          {"Key" : "Environment", "Value" : { "Ref" : "Environment"} },
+          {"Key" : "ServerRole", "Value" : "Bastion" },
+          {"Key" : "Network", "Value" : "Public" }
+        ]
+      }
+    },
+
+    "BastionWaitHandle" : {
+      "Type" : "AWS::CloudFormation::WaitConditionHandle"
+    },
+
+    "BastionWaitCondition" : {
+      "Type" : "AWS::CloudFormation::WaitCondition",
+      "DependsOn" : "BastionInstance",
+      "Properties" : {
+        "Handle" : {"Ref" : "BastionWaitHandle"},
+        "Timeout" : "540",
+        "Count" : "3"
+      }
+    },
+
+    "WebDBServerSecurityGroup" : {
+      "Type" : "AWS::EC2::SecurityGroup",
+      "Properties" : {
+        "VpcId" : { "Ref" : "VPC" },
+        "GroupDescription" : "Enable secure access to the Web and DB server",
+        "SecurityGroupIngress" : [
+          { "IpProtocol": "tcp", "FromPort": "22", "ToPort": "22", "SourceSecurityGroupId": { "Ref" :"BastionSecurityGroup" } },
+          { "IpProtocol": "tcp", "FromPort": "80", "ToPort": "80", "SourceSecurityGroupId": { "Ref" :"LBSecurityGroup" } },
+          { "IpProtocol": "tcp", "FromPort": "443", "ToPort": "443", "SourceSecurityGroupId": { "Ref" :"LBSecurityGroup" } },
+          { "IpProtocol": "tcp", "FromPort": "80", "ToPort": "80", "CidrIp": {"Fn::FindInMap": [ "Env2VPNNet", { "Ref": "Environment" }, "vpnnet" ] }},
+          { "IpProtocol": "tcp", "FromPort": "443", "ToPort": "443", "CidrIp": {"Fn::FindInMap": [ "Env2VPNNet", { "Ref": "Environment" }, "vpnnet" ] }},
+          { "IpProtocol": "tcp", "FromPort": "3306", "ToPort": "3306", "CidrIp": {"Fn::FindInMap": [ "Env2VPNNet", { "Ref": "Environment" }, "vpnnet" ] }},
+          { "IpProtocol": "tcp", "FromPort": "22", "ToPort": "22", "CidrIp": {"Fn::FindInMap": [ "Env2VPNNet", { "Ref": "Environment" }, "vpnnet" ] }}
+         ]
+      }
+    },
+
+    "WebDBServerInstance" : {
+      "Type" : "AWS::EC2::Instance",
+      "Properties" : {
+        "ImageId" : { "Fn::FindInMap": [ "RegionArch2AMI", { "Ref": "AWS::Region" }, { "Fn::FindInMap": [ "InstanceType2Arch", { "Ref": "WebDBServerInstanceType" }, "Arch" ] } ] },
+        "SecurityGroupIds" : [{ "Ref" : "WebDBServerSecurityGroup" }],
+        "SubnetId" : { "Ref" : "PrivateSubnet" },
+        "InstanceType" : { "Ref" : "WebDBServerInstanceType" },
+        "UserData" : { "Fn::Base64" : { "Fn::Join" : ["", [
+            "#!/bin/bash\n",
+
+            "set -e -x\n",
+            "export CHEF_RDIR='/usr/local/share/chef-solo'\n",
+            "export PROXY_ADDRESS=http://", { "Fn::GetAtt" : ["BastionInstance", "PrivateIp"] }, ":3128/\n",
+            "export http_proxy=$PROXY_ADDRESS\n",
+            "export https_proxy=$PROXY_ADDRESS\n",
+            "export ftp_proxy=$PROXY_ADDRESS\n",
+            "cat << EOF >> /etc/bash.bashrc\n",
+            "export http_proxy=$PROXY_ADDRESS\n",
+            "export https_proxy=$PROXY_ADDRESS\n",
+            "export ftp_proxy=$PROXY_ADDRESS\n",
+            "EOF\n",
+            "cat << EOF >> /etc/apt/apt.conf.d/95proxy\n",
+            "Acquire::http::proxy \"$PROXY_ADDRESS\";\n",
+            "Acquire::ftp::proxy \"$PROXY_ADDRESS\";\n",
+            "Acquire::https::proxy \"$PROXY_ADDRESS\";\n",
+            "EOF\n",
+            "signalid=$RANDOM\n",
+            "function error_exit\n",
+            "{\n",
+            "  date +%s\n",
+            "  cfn-signal -e 1 -r \"$1\" '", { "Ref" : "WebDBServerWaitHandle" }, "'\n",
+            "  exit 1\n",
+            "}\n",
+
+            "function signal_success\n",
+            "{\n",
+            "  date +%s\n",
+            "  cfn-signal -e 0 -d \"$1\" -i \"$((signalid++))\" '", { "Ref" : "WebDBServerWaitHandle" }, "'\n",
+            "}\n",
+
+            "export DEBIAN_FRONTEND=noninteractive\n",
+            "apt-get --yes --quiet install python-setuptools || error_exit 'Failed to install python-setuptools'\n",
+            "easy_install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-1.0-6.tar.gz || error_exit 'Failed to install CFN scripts'\n",
+            "signal_success 'WebDBServer initialization - CFN'\n",
+            "cat << EOF >> /home/ubuntu/.s3cfg\n",
+            "[default]\n",
+            "access_key = ", { "Ref" : "WebDBAWSAccessKey" }, "\n",
+            "secret_key = ", { "Fn::GetAtt" : [ "WebDBAWSAccessKey", "SecretAccessKey" ] }, "\n",
+            "use_https = True\n",
+            "EOF\n",
+            "echo \"deb http://apt.opscode.com/ `lsb_release -cs`-0.10 main\" | tee /etc/apt/sources.list.d/opscode.list\n",
+            "gpg --keyserver keys.gnupg.net --recv-keys 83EF826A || gpg --keyserver pgp.mit.edu --recv-keys 83EF826A || error_exit 'Failed to obtain opscode PGP key'\n",
+            "gpg --export packages@opscode.com > /etc/apt/trusted.gpg.d/opscode-keyring.gpg\n",
+            "apt-get --yes --quiet update || error_exit 'Failed to update APT listing'\n",
+            "echo \"chef chef/chef_server_url string none\" | debconf-set-selections\n",
+            "apt-get --quiet --yes install opscode-keyring chef || error_exit 'Failed to install chef and opscode-keyring'\n",
+            "signal_success 'WebDBServer initialization - Chef installation'\n",
+            "apt-get --yes --quiet upgrade\n",
+            "apt-get --yes --quiet install git-core ssl-cert s3cmd mdadm xfsprogs lvm2 || error_exit 'Failed to install git'\n",
+            "cat << EOF > /etc/chef/solo.rb\n",
+            "log_level :info\n",
+            "log_location STDOUT\n",
+            "file_cache_path \"$CHEF_RDIR\"\n",
+            "cookbook_path \"$CHEF_RDIR/cookbooks\"\n",
+            "data_bag_path \"$CHEF_RDIR/data_bags\"\n",
+            "http_proxy \"$PROXY_ADDRESS\"\n",
+            "https_proxy \"$PROXY_ADDRESS\"\n",
+            "json_attribs \"/etc/chef/node.json\"\n",
+            "EOF\n",
+            "mkdir /root/.chef/\n",
+            "cat << EOF >> /root/.chef/knife.rb\n",
+            "http_proxy \"$PROXY_ADDRESS\"\n",
+            "https_proxy \"$PROXY_ADDRESS\"\n",
+            "log_level :info\n",
+            "log_location STDOUT\n",
+            "cache_type \"BasicFile\"\n",
+            "EOF\n",
+            "cat << EOF > /etc/chef/node.json\n",
+            "{\n\t\"nginx\": {\n",
+            "\t\t\"version\":\"1.0.11\",\n",
+            "\t\t\"init_style\":\"sysvinit\",\n",
+            "\t\t\"source\": {\n",
+            "\t\t\t\"prefix\":\"/usr/local/nginx/\",\n",
+            "\t\t\t\"checksum\":\"4a382de6b89ec7eae03bfc9f9716bca5567993d0ae90fbd5f75c1ea598f7d722\",\n",
+            "\t\t\t\"modules\": [\n",
+            "\t\t\t\t\"http_gzip_static_module\",\n",
+            "\t\t\t\t\"http_ssl_module\",\n",
+            "\t\t\t\t\"http_dav_module\",\n",
+            "\t\t\t\t\"http_stub_status_module\",\n",
+            "\t\t\t\t\"push_stream_module\",\n",
+            "\t\t\t\t\"upload_module\",\n",
+            "\t\t\t\t\"upload_progress_module\"\n",
+            "\t\t\t],\n",
+            "\t\t\t\"default_configure_flags\": [\n",
+            "\t\t\t\t\"--prefix=/usr/local/nginx/\",\n",
+            "\t\t\t\t\"--conf-path=/etc/nginx/nginx.conf\",\n",
+            "\t\t\t\t\"--http-client-body-temp-path=/var/lib/nginx/body\",\n",
+            "\t\t\t\t\"--with-debug\",\n",
+            "\t\t\t\t\"--http-proxy-temp-path=/var/lib/nginx/proxy\",\n",
+            "\t\t\t\t\"--http-fastcgi-temp-path=/var/lib/nginx/fastcgi\"\n",
+            "\t\t\t]\n",
+            "\t\t}\n",
+            "\t},\n",
+            "\t\"percona\": {\n",
+            "\t\t\"server\": {\n",
+            "\t\t\t\"datadir\": \"/var/lib/mysql/datafiles\",\n",
+            "\t\t\t\"root_password\": \"change-the-root-password\",\n",
+            "\t\t\t\"debian_password\": \"change-the-system-maintaner-password\",\n",
+            "\t\t\t\"old_passwords\": \"off\",\n",
+            "\t\t\t\"bind_address\": \"\"\n",
+            "\t\t}\n",
+            "\t},\n",
+            "\t\"rvm\":{\n",
+            "\t\t\"default_ruby\":\"1.9.3-p125\",\n",
+            "\t\t\"group_users\": [\"elewis\"],\n",
+            "\t\t\"global_gems\": [{\"name\": \"bundler\"}],\n",
+            "\t\t\"gems\": {\n",
+            "\t\t\t\"@sulfur-rails-3-2\": [{\"name\": \"nokogiri\"}],\n",
+            "\t\t\t\"@sysadmin\": [{\"name\": \"s3sync\"}]\n",
+            "\t\t}\n",
+            "\t},\n",
+            "\t\"users\": [\"elewis\", \"genadmin\"],\n",
+            "\t\"run_list\":[\"recipe[nginx::source]\",\"recipe[percona::client]\",\"recipe[percona::server]\",\"recipe[user::data_bag]\",\"recipe[rvm::system]\"]\n",
+            "}\n",
+            "EOF\n",
+            "chmod 600 /etc/chef/node.json\n",
+            "git clone -b sulfur-project ", {"Ref": "ChefRepo"}, " $CHEF_RDIR >> /tmp/bootscript.log || error_exit 'Failed to install chef skeleton'\n",
+            "(cd $CHEF_RDIR && git checkout -b master origin/sulfur-project)\n",
+            "mkdir -p $CHEF_RDIR/data_bags/users\n",
+            "cat << EOF >> $CHEF_RDIR/data_bags/users/zorlem.json\n",
+            "{\n\"id\": \"zorlem\",\n",
+            "\"comment\": \"Hristo Erinin\",\n",
+            "\"ssh_keygen\": \"no\",\n",
+            "\"ssh_keys\": [\n",
+            "\"no-port-forwarding,no-X11-forwarding ssh-rsa AAAAB3NzaC........ zorlem-greend\",\n",
+            "\"no-port-forwarding,no-X11-forwarding ssh-dss AAAAB3NzaC........ zorlem-angst\"\n",
+            "]\n}\n",
+            "EOF\n",
+            "cat << EOF >> $CHEF_RDIR/data_bags/users/sulfur-users.json\n",
+            "{\n\"id\": \"genadmin\",\n",
+            "\"comment\": \"Generic account for the website\",\n",
+            "\"ssh_keygen\": \"no\",\n",
+            "\"ssh_keys\": [\n",
+            "\"no-port-forwarding,no-X11-forwarding ssh-rsa AAAAB3NzaC........ zorlem-greend\",\n",
+            "\"no-port-forwarding,no-X11-forwarding ssh-dss AAAAB3NzaC........ zorlem-angst\"\n",
+            "]\n}\n",
+            "EOF\n",
+            "cat << EOF >> $CHEF_RDIR/data_bags/users/elewis.json\n",
+            "{\n\"id\": \"elewis\",\n",
+            "\"comment\": \"Edward Lewis\",\n",
+            "\"ssh_keygen\": \"no\",\n",
+            "\"ssh_keys\": [\n",
+            "\"no-port-forwarding,no-X11-forwarding ssh-rsa AAAAB3NzaC........ zorlem-greend\",\n",
+            "\"no-port-forwarding,no-X11-forwarding ssh-dss AAAAB3NzaC........ zorlem-angst\"\n",
+            "]\n}\n",
+            "EOF\n",
+            "update-rc.d chef-client disable\n",
+            "service chef-client stop\n",
+            "chef-solo >> /tmp/bootscript.log || error_exit 'Failed to configure the server with Chef'\n",
+            "signal_success 'WebDBServer initialization - Chef configuration complete'\n",
+            "## Waiting for EBS mounts to become available\n",
+            "for disk in sdi1 sdi2 sdi3 sdi4 sdj1 sdj2; do\n",
+            "   while [ ! -e /dev/${disk} ]; do echo Waiting for disk ${disk} to attach; sleep 10; done\n",
+            "done\n",
+            "mdadm --verbose --create /dev/md0 --level=10 --chunk=256 --raid-devices=4 /dev/sdi1 /dev/sdi2 /dev/sdi3 /dev/sdi4 >> /tmp/mdadm.log 2>&1\n",
+            "mdadm --verbose --create /dev/md1 --level=1 --chunk=256 --raid-devices=2 /dev/sdj1 /dev/sdj2 >> /tmp/mdadm.log 2>&1\n",
+            "mdadm --detail --scan | tee -a /etc/mdadm/mdadm.conf\n",
+            "## Set read-ahead on each device\n",
+            "for dev in md0 md1 sdi1 sdi2 sdi3 sdi4 sdj1 sdj2; do\n",
+            "   blockdev --setra 128 /dev/${dev}\n",
+            "done\n",
+            "## Create physical and logical volumes\n",
+            "dd if=/dev/zero of=/dev/md0 bs=512 count=1\n",
+            "pvcreate /dev/md0\n",
+            "vgcreate db /dev/md0\n",
+            "lvcreate -l 97%vg -n data db\n",
+            "dd if=/dev/zero of=/dev/md1 bs=512 count=1\n",
+            "pvcreate /dev/md1\n",
+            "vgcreate web /dev/md1\n",
+            "lvcreate -l 97%vg -n data web\n",
+            "## Create filesystems and mount point info\n",
+            "mkfs.xfs -f /dev/db/data >> /tmp/mkxfs.log 2>&1\n",
+            "mkfs.xfs -f /dev/web/data >> /tmp/mkxfs.log 2>&1\n",
+            "mkdir /data\n",
+            "mkdir /mnt/tmp\n",
+            "service mysql stop\n",
+            "echo '/dev/db/data /var/lib/mysql xfs defaults,auto,noatime,noexec,nobootwait 0 0' | tee -a /etc/fstab\n",
+            "echo '/dev/web/data /data xfs defaults,auto,noatime,noexec,nobootwait 0 0' | tee -a /etc/fstab\n",
+            "mount /dev/db/data /mnt/tmp && mv /var/lib/mysql/* /mnt/tmp && umount /mnt/tmp\n",
+            "mount /data >> /tmp/mount.log 2>&1\n",
+            "mount /var/lib/mysql >> /tmp/mount.log 2>&1\n",
+            "service mysql start\n",
+            "update-initramfs -u -k all\n",
+            "echo Success\n"
+
+        ]]}},
+
+        "KeyName" : { "Ref" : "KeyName" },
+        "Tags" : [
+          {"Key" : "Application", "Value" : { "Ref" : "AWS::StackName"} },
+          {"Key" : "Environment", "Value" : { "Ref" : "Environment"} },
+          {"Key" : "ServerRole", "Value" : "Web" },
+          {"Key" : "Network", "Value" : "Private" }
+        ]
+      },
+      "DependsOn" : "BastionWaitCondition"
+    },
+
+    "DataVol1" : {
+      "Type" : "AWS::EC2::Volume",
+      "Properties" : {
+        "Size" : { "Ref" : "DataVolumeSize" },
+        "AvailabilityZone" : { "Fn::GetAtt" : [ "WebDBServerInstance", "AvailabilityZone" ]}
+      }
+    },
+
+    "DataVol2" : {
+      "Type" : "AWS::EC2::Volume",
+      "Properties" : {
+        "Size" : { "Ref" : "DataVolumeSize" },
+        "AvailabilityZone" : { "Fn::GetAtt" : [ "WebDBServerInstance", "AvailabilityZone" ]}
+      }
+    },
+
+    "DataVol3" : {
+      "Type" : "AWS::EC2::Volume",
+      "Properties" : {
+        "Size" : { "Ref" : "DataVolumeSize" },
+        "AvailabilityZone" : { "Fn::GetAtt" : [ "WebDBServerInstance", "AvailabilityZone" ]}
+      }
+    },
+
+    "DataVol4" : {
+      "Type" : "AWS::EC2::Volume",
+      "Properties" : {
+        "Size" : { "Ref" : "DataVolumeSize" },
+        "AvailabilityZone" : { "Fn::GetAtt" : [ "WebDBServerInstance", "AvailabilityZone" ]}
+      }
+    },
+
+    "DataMountPoint1" : {
+      "Type" : "AWS::EC2::VolumeAttachment",
+      "Properties" : {
+        "InstanceId" : { "Ref" : "WebDBServerInstance" },
+        "VolumeId"  : { "Ref" : "DataVol1" },
+        "Device" : "/dev/sdi1"
+      }
+    },
+
+    "DataMountPoint2" : {
+      "Type" : "AWS::EC2::VolumeAttachment",
+      "Properties" : {
+        "InstanceId" : { "Ref" : "WebDBServerInstance" },
+        "VolumeId"  : { "Ref" : "DataVol2" },
+        "Device" : "/dev/sdi2"
+      }
+    },
+
+    "DataMountPoint3" : {
+      "Type" : "AWS::EC2::VolumeAttachment",
+      "Properties" : {
+        "InstanceId" : { "Ref" : "WebDBServerInstance" },
+        "VolumeId"  : { "Ref" : "DataVol3" },
+        "Device" : "/dev/sdi3"
+      }
+    },
+
+    "DataMountPoint4" : {
+      "Type" : "AWS::EC2::VolumeAttachment",
+      "Properties" : {
+        "InstanceId" : { "Ref" : "WebDBServerInstance" },
+        "VolumeId"  : { "Ref" : "DataVol4" },
+        "Device" : "/dev/sdi4"
+      }
+    },
+
+    "WebVol1" : {
+      "Type" : "AWS::EC2::Volume",
+      "Properties" : {
+        "Size" : { "Ref" : "DataVolumeSize" },
+        "AvailabilityZone" : { "Fn::GetAtt" : [ "WebDBServerInstance", "AvailabilityZone" ]}
+      }
+    },
+
+    "WebVol2" : {
+      "Type" : "AWS::EC2::Volume",
+      "Properties" : {
+        "Size" : { "Ref" : "DataVolumeSize" },
+        "AvailabilityZone" : { "Fn::GetAtt" : [ "WebDBServerInstance", "AvailabilityZone" ]}
+      }
+    },
+
+    "WebMountPoint1" : {
+      "Type" : "AWS::EC2::VolumeAttachment",
+      "Properties" : {
+        "InstanceId" : { "Ref" : "WebDBServerInstance" },
+        "VolumeId"  : { "Ref" : "WebVol1" },
+        "Device" : "/dev/sdj1"
+      }
+    },
+
+    "WebMountPoint2" : {
+      "Type" : "AWS::EC2::VolumeAttachment",
+      "Properties" : {
+        "InstanceId" : { "Ref" : "WebDBServerInstance" },
+        "VolumeId"  : { "Ref" : "WebVol2" },
+        "Device" : "/dev/sdj2"
+      }
+    },
+
+    "WebDBServerWaitHandle" : {
+      "Type" : "AWS::CloudFormation::WaitConditionHandle"
+    },
+
+    "WebDBServerWaitCondition" : {
+      "Type" : "AWS::CloudFormation::WaitCondition",
+      "DependsOn" : "WebDBServerInstance",
+      "Properties" : {
+        "Handle" : {"Ref" : "WebDBServerWaitHandle"},
+        "Timeout" : "1440",
+        "Count" : "3"
+      }
+    },
+
+    "WebHostnames": {
+      "Type" : "AWS::Route53::RecordSetGroup",
+      "Properties" : {
+        "HostedZoneName" : {"Fn::Join" : ["", [ { "Ref" : "Domain" }, "."] ] },
+        "Comment" : "zone apex and the www pointing to the LB",
+        "RecordSets" : [
+          {
+            "Name" : { "Fn::Join" :
+                      ["",
+                        [
+                          { "Fn::FindInMap": [ "Env2Domain", { "Ref": "Environment" }, "domain" ] },
+                          { "Ref" : "Domain" },
+                          "."
+                        ]
+                      ]
+            },
+            "Type" : "A",
+            "AliasTarget" : {
+              "HostedZoneId" : { "Fn::GetAtt" : [ "ElasticLoadBalancer", "CanonicalHostedZoneNameID" ] },
+              "DNSName" : { "Fn::GetAtt" : [ "ElasticLoadBalancer","CanonicalHostedZoneName" ] }
+            }
+          },
+          {
+            "Name" : { "Fn::Join" :
+                      ["",
+                        [
+                          "www.",
+                          { "Fn::FindInMap": [ "Env2Domain", { "Ref": "Environment" }, "domain" ] },
+                          { "Ref" : "Domain" },
+                          "."
+                        ]
+                      ]
+            },
+            "Type" : "A",
+            "AliasTarget" : {
+              "HostedZoneId" : { "Fn::GetAtt" : [ "ElasticLoadBalancer", "CanonicalHostedZoneNameID" ] },
+              "DNSName" : { "Fn::GetAtt" : [ "ElasticLoadBalancer","CanonicalHostedZoneName" ] }
+            }
+          }
+        ]
+      }
+    },
+    "ServerHostnames": {
+      "Type" : "AWS::Route53::RecordSetGroup",
+      "Properties" : {
+        "HostedZoneName" : {"Fn::Join" : ["", [ { "Ref" : "Domain" }, "."] ] },
+        "Comment" : "zone apex and the www pointing to the LB",
+        "RecordSets" : [
+          {
+            "Name" : { "Fn::Join" :
+                      ["",
+                        [
+                          "w1.",
+                          { "Fn::FindInMap": [ "Env2Domain", { "Ref": "Environment" }, "domain" ] },
+                          { "Ref" : "Domain" },
+                          "."
+                        ]
+                      ]
+            },
+            "Type" : "A",
+            "TTL": "900",
+            "ResourceRecords": [ { "Fn::GetAtt" : ["WebDBServerInstance", "PrivateIp"] } ]
+          },
+          {
+            "Name" : { "Fn::Join" :
+                      ["",
+                        [
+                          "d1.",
+                          { "Fn::FindInMap": [ "Env2Domain", { "Ref": "Environment" }, "domain" ] },
+                          { "Ref" : "Domain" },
+                          "."
+                        ]
+                      ]
+            },
+            "Type" : "A",
+            "TTL": "900",
+            "ResourceRecords": [ { "Fn::GetAtt" : ["WebDBServerInstance", "PrivateIp"] } ]
+          }
+        ]
+      }
+    },
+    "BastionHostnames": {
+      "Type" : "AWS::Route53::RecordSetGroup",
+      "Properties" : {
+        "HostedZoneName" : {"Fn::Join" : ["", [ { "Ref" : "Domain" }, "."] ] },
+        "Comment" : "hostnames for ovpn and bastion pointing to the bastion box",
+        "RecordSets" : [
+          {
+            "Name" : { "Fn::Join" :
+                      ["",
+                        [
+			  "ovpn.",
+                          { "Fn::FindInMap": [ "Env2Domain", { "Ref": "Environment" }, "domain" ] },
+                          { "Ref" : "Domain" },
+                          "."
+                        ]
+                      ]
+            },
+            "Type" : "A",
+            "TTL" : "900",
+            "ResourceRecords" : [
+              { "Fn::GetAtt": ["BastionInstance", "PublicIp" ] }
+            ]
+          }
+        ]
+      }
+    }
+  },
+
+  "Outputs" : {
+
+    "BastionWaitConditionData" : {
+      "Value" : { "Fn::GetAtt" : [ "BastionWaitCondition", "Data" ]},
+      "Description" : "The data passed back as part of signalling the WaitCondition"
+    },
+
+    "WebDBServerWaitConditionData" : {
+      "Value" : { "Fn::GetAtt" : [ "WebDBServerWaitCondition", "Data" ]},
+      "Description" : "The data passed back as part of signalling the WaitCondition"
+    },
+
+    "BastionIP" : {
+      "Value" : { "Fn::GetAtt" : ["BastionInstance", "PublicIp"] },
+      "Description" : "The IP address of the Bastion server."
+    },
+    "BastionHostname": {
+      "Value": { "Fn::Join" : ["", [ "ovpn.", { "Fn::FindInMap": [ "Env2Domain", { "Ref": "Environment" }, "domain" ] }, { "Ref" : "Domain" } ] ] },
+      "Description": "The hostname assigned to the bastion host"
+    },
+    "ServerIP" : {
+      "Value" : { "Fn::GetAtt" : ["WebDBServerInstance", "PrivateIp"] },
+      "Description" : "The IP address of the Web and DB server."
+    },
+    "ServerHostname": {
+      "Value": {"Fn::Join": ["", 
+        [ "w1.", {"Fn::FindInMap": ["Env2Domain", {"Ref": "Environment"}, "domain"]}, {"Ref": "Domain"},", ", 
+          "d1.", {"Fn::FindInMap": ["Env2Domain", {"Ref": "Environment"}, "domain"]}, {"Ref": "Domain" }] 
+        ]
+      },
+      "Description": "The hostnames assigned to the WebDB host"
+    },
+    "LBAddress" : {
+      "Value" : { "Fn::GetAtt" : ["ElasticLoadBalancer", "DNSName"] },
+      "Description" : "The hostname assigned to the LB."
+    }
+  }
+}
+
